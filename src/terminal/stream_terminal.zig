@@ -17,6 +17,7 @@ const osc_color = @import("osc/parsers/color.zig");
 const kitty_color = @import("kitty/color.zig");
 const size_report = @import("size_report.zig");
 const Terminal = @import("Terminal.zig");
+const terminfo = @import("../terminfo/main.zig");
 
 const log = std.log.scoped(.stream_terminal);
 
@@ -395,9 +396,23 @@ pub const Handler = struct {
                 self.writePty(response[0..encoded.len :0]);
             },
 
-            .tmux,
-            .xtgettcap,
-            => {},
+            .xtgettcap => |*gettcap| {
+                // Keep libghostty-vt's replies in parity with Ghostty's full
+                // termio path. The map keys are the uppercase hex strings
+                // carried by XTGETTCAP and its values are complete replies.
+                if (self.effects.write_pty == null) return;
+
+                const map = comptime terminfo.ghostty.xtgettcapMap();
+                while (gettcap.next()) |key| {
+                    const response = map.get(key) orelse continue;
+                    const response_z = self.terminal.gpa().dupeZ(u8, response) catch
+                        continue;
+                    defer self.terminal.gpa().free(response_z);
+                    self.writePty(response_z);
+                }
+            },
+
+            .tmux => {},
         }
     }
 
@@ -1465,6 +1480,128 @@ test "DECRQSS without write effect is ignored" {
     try testing.expect(!s.handler.semantic_failure);
 }
 
+test "XTGETTCAP reports static Ghostty terminfo capabilities" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var response: [128]u8 = undefined;
+        var response_len: usize = 0;
+        var calls: usize = 0;
+
+        fn reset() void {
+            response_len = 0;
+            calls = 0;
+        }
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            @memcpy(response[0..data.len], data);
+            response_len = data.len;
+            calls += 1;
+        }
+    };
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // TN is the primary name from Ghostty's static terminfo source.
+    s.nextSlice("\x1BP+q544E\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.calls);
+    try testing.expectEqualStrings(
+        "\x1BP1+r544E=787465726D2D67686F73747479\x1B\\",
+        S.response[0..S.response_len],
+    );
+}
+
+test "XTGETTCAP reports each known key in a multiple-key request" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var responses: [2][128]u8 = undefined;
+        var response_lens: [2]usize = @splat(0);
+        var calls: usize = 0;
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            @memcpy(responses[calls][0..data.len], data);
+            response_lens[calls] = data.len;
+            calls += 1;
+        }
+    };
+    S.response_lens = @splat(0);
+    S.calls = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // Mixed-case hex input is normalized by the DCS parser.
+    s.nextSlice("\x1BP+q616d;436f\x1B\\");
+    try testing.expectEqual(@as(usize, 2), S.calls);
+    try testing.expectEqualStrings(
+        "\x1BP1+r616D\x1B\\",
+        S.responses[0][0..S.response_lens[0]],
+    );
+    try testing.expectEqualStrings(
+        "\x1BP1+r436F=323536\x1B\\",
+        S.responses[1][0..S.response_lens[1]],
+    );
+}
+
+test "XTGETTCAP ignores unknown and malformed keys" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var calls: usize = 0;
+
+        fn writePty(_: *Handler, _: [:0]const u8) void {
+            calls += 1;
+        }
+    };
+    S.calls = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    s.nextSlice("\x1BP+qWHO;5;GG\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.calls);
+    try testing.expect(!s.handler.semantic_failure);
+}
+
+test "XTGETTCAP without write effect is ignored" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .init(&t));
+    defer s.deinit();
+
+    s.nextSlice("\x1BP+q544E;616D\x1B\\");
+    try testing.expect(!s.handler.semantic_failure);
+}
+
 test "DCS command memory is released" {
     var t: Terminal = try .init(
         testing.io,
@@ -1475,8 +1612,8 @@ test "DCS command memory is released" {
 
     var s: Stream = .initAlloc(testing.allocator, .init(&t));
 
-    // A completed, unsupported command transfers its allocation to Command;
-    // dcsCommand must release it even though stream_terminal ignores it.
+    // A completed command transfers its allocation to Command; dcsCommand
+    // must release it even when there is no write effect.
     s.nextSlice("\x1BP+q536D756C78\x1B\\");
 
     // An incomplete command remains owned by the handler and must be released
