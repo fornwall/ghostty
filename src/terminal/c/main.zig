@@ -187,6 +187,7 @@ pub const terminal_compression_activity = terminal.compression_activity;
 pub const terminal_compress = terminal.compress;
 pub const terminal_mode_get = terminal.mode_get;
 pub const terminal_mode_set = terminal.mode_set;
+pub const terminal_mode_set_default = terminal.mode_set_default;
 pub const terminal_get = terminal.get;
 pub const terminal_get_multi = terminal.get_multi;
 pub const terminal_select_word = selection.word;

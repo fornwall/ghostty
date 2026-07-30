@@ -42,6 +42,20 @@ pub const ModeState = struct {
         }
     }
 
+    /// Set both the current value and the value restored by a terminal reset.
+    ///
+    /// Embedders use this during terminal initialization to apply their
+    /// configured defaults before processing untrusted terminal input.
+    pub fn setDefault(self: *ModeState, mode: Mode, value: bool) void {
+        switch (mode) {
+            inline else => |mode_comptime| {
+                const entry = comptime entryForMode(mode_comptime);
+                @field(self.values, entry.name) = value;
+                @field(self.default, entry.name) = value;
+            },
+        }
+    }
+
     /// Get the value of a mode.
     pub fn get(self: *const ModeState, mode: Mode) bool {
         switch (mode) {
@@ -312,6 +326,14 @@ test ModeState {
     try testing.expect(!state.get(.cursor_keys));
     try testing.expect(state.restore(.cursor_keys));
     try testing.expect(state.get(.cursor_keys));
+
+    // An embedder default affects the live mode and survives reset.
+    state.setDefault(.grapheme_cluster, true);
+    try testing.expect(state.get(.grapheme_cluster));
+    state.set(.grapheme_cluster, false);
+    try testing.expect(!state.get(.grapheme_cluster));
+    state.reset();
+    try testing.expect(state.get(.grapheme_cluster));
 }
 
 test "getReport known DEC mode" {

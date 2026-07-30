@@ -831,6 +831,18 @@ pub fn mode_set(
     return .success;
 }
 
+pub fn mode_set_default(
+    terminal_: Terminal,
+    tag: modes.ModeTag.Backing,
+    value: bool,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const mode_tag: modes.ModeTag = @bitCast(tag);
+    const mode = modes.modeFromInt(mode_tag.value, mode_tag.ansi) orelse return .invalid_value;
+    t.modes.setDefault(mode, value);
+    return .success;
+}
+
 /// C: GhosttyKittyGraphics
 pub const KittyGraphics = kitty_gfx_c.KittyGraphics;
 
@@ -1588,6 +1600,194 @@ test "mode_get and mode_set" {
     try testing.expectEqual(Result.success, mode_set(t, insert, true));
     try testing.expectEqual(Result.success, mode_get(t, insert, &value));
     try testing.expect(value);
+}
+
+test "mode_set_default sets the live value and survives reset" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var value: bool = undefined;
+
+    // DEC mode 2027 (grapheme_cluster) is off by default. It is the mode
+    // this API exists for: an embedder that follows Ghostty's recommended
+    // grapheme-width-method needs it enabled and *kept* enabled by RIS.
+    const grapheme: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 2027, .ansi = false });
+    try testing.expectEqual(Result.success, mode_get(t, grapheme, &value));
+    try testing.expect(!value);
+
+    // Setting the default sets the live value too.
+    try testing.expectEqual(Result.success, mode_set_default(t, grapheme, true));
+    try testing.expectEqual(Result.success, mode_get(t, grapheme, &value));
+    try testing.expect(value);
+
+    // A remote application may still turn it off...
+    try testing.expectEqual(Result.success, mode_set(t, grapheme, false));
+    try testing.expectEqual(Result.success, mode_get(t, grapheme, &value));
+    try testing.expect(!value);
+
+    // ...but a reset returns it to the embedder's default, not to the
+    // core's. This is the whole point: mode_set alone would leave it off.
+    reset(t);
+    try testing.expectEqual(Result.success, mode_get(t, grapheme, &value));
+    try testing.expect(value);
+
+    // RIS through the stream behaves identically to the reset entry point.
+    try testing.expectEqual(Result.success, mode_set(t, grapheme, false));
+    vt_write(t, "\x1Bc", 2);
+    try testing.expectEqual(Result.success, mode_get(t, grapheme, &value));
+    try testing.expect(value);
+}
+
+test "mode_set_default false pins a mode off across reset" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var value: bool = undefined;
+
+    // DEC mode 25 (cursor_visible) is on by default, so this is the
+    // opposite direction: an embedder pinning a mode off.
+    const cursor_visible: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 25, .ansi = false });
+    try testing.expectEqual(Result.success, mode_set_default(t, cursor_visible, false));
+    try testing.expectEqual(Result.success, mode_get(t, cursor_visible, &value));
+    try testing.expect(!value);
+
+    try testing.expectEqual(Result.success, mode_set(t, cursor_visible, true));
+    reset(t);
+    try testing.expectEqual(Result.success, mode_get(t, cursor_visible, &value));
+    try testing.expect(!value);
+}
+
+test "mode_set_default does not disturb other modes" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var value: bool = undefined;
+    const grapheme: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 2027, .ansi = false });
+    const wraparound: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 7, .ansi = false });
+    const insert: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 4, .ansi = true });
+
+    try testing.expectEqual(Result.success, mode_set_default(t, grapheme, true));
+
+    // Wraparound is on by default and stays on.
+    try testing.expectEqual(Result.success, mode_get(t, wraparound, &value));
+    try testing.expect(value);
+
+    // An ANSI mode set live, not as a default, is still discarded by reset
+    // even though a DEC mode default was installed.
+    try testing.expectEqual(Result.success, mode_set(t, insert, true));
+    reset(t);
+    try testing.expectEqual(Result.success, mode_get(t, insert, &value));
+    try testing.expect(!value);
+    try testing.expectEqual(Result.success, mode_get(t, wraparound, &value));
+    try testing.expect(value);
+    try testing.expectEqual(Result.success, mode_get(t, grapheme, &value));
+    try testing.expect(value);
+}
+
+test "mode_set_default leaves the XTSAVE slot alone" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var value: bool = undefined;
+    const grapheme: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 2027, .ansi = false });
+
+    // Save the mode while it is off, then install a default of on.
+    vt_write(t, "\x1B[?2027s", 9);
+    try testing.expectEqual(Result.success, mode_set_default(t, grapheme, true));
+    try testing.expectEqual(Result.success, mode_get(t, grapheme, &value));
+    try testing.expect(value);
+
+    // XTRESTORE restores what was saved, not the new default.
+    vt_write(t, "\x1B[?2027r", 9);
+    try testing.expectEqual(Result.success, mode_get(t, grapheme, &value));
+    try testing.expect(!value);
+}
+
+test "mode_set_default is visible to DECRQM before and after reset" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var last_data: ?[]u8 = null;
+
+        fn deinit() void {
+            if (last_data) |d| testing.allocator.free(d);
+            last_data = null;
+        }
+
+        fn writePty(_: Terminal, _: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(lib.calling_conv) void {
+            if (last_data) |d| testing.allocator.free(d);
+            last_data = testing.allocator.dupe(u8, ptr[0..len]) catch @panic("OOM");
+        }
+    };
+    defer S.deinit();
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+
+    const grapheme: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 2027, .ansi = false });
+
+    // Reset (2) before the default is installed.
+    vt_write(t, "\x1B[?2027$p", 9);
+    try testing.expectEqualStrings("\x1B[?2027;2$y", S.last_data.?);
+
+    // Set (1) immediately after.
+    try testing.expectEqual(Result.success, mode_set_default(t, grapheme, true));
+    vt_write(t, "\x1B[?2027$p", 9);
+    try testing.expectEqualStrings("\x1B[?2027;1$y", S.last_data.?);
+
+    // And still set (1) after RIS, which is what an application probing
+    // the terminal after a reset needs to see.
+    vt_write(t, "\x1Bc", 2);
+    vt_write(t, "\x1B[?2027$p", 9);
+    try testing.expectEqualStrings("\x1B[?2027;1$y", S.last_data.?);
+}
+
+test "mode_set_default null" {
+    const tag: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 2027, .ansi = false });
+    try testing.expectEqual(Result.invalid_value, mode_set_default(null, tag, true));
+}
+
+test "mode_set_default unknown mode" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const unknown: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 9999, .ansi = false });
+    try testing.expectEqual(Result.invalid_value, mode_set_default(t, unknown, true));
 }
 
 test "mode_get null" {

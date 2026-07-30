@@ -1648,6 +1648,50 @@ GHOSTTY_API GhosttyResult ghostty_terminal_mode_set(GhosttyTerminal terminal,
                                          bool value);
 
 /**
+ * Set both the current value of a terminal mode and the value it is
+ * restored to by a terminal reset.
+ *
+ * ghostty_terminal_mode_set() changes only the live value, which RIS
+ * (`ESC c`) and DECSTR then discard. This function additionally changes the
+ * value the terminal reverts to, so an embedder can express "this mode is my
+ * application's default" rather than only "this mode is on right now".
+ *
+ * This is the runtime equivalent of the default mode set a terminal is
+ * constructed with, and it sets the live value for the same reason the
+ * constructor does: an embedder applying its configuration wants the mode
+ * active immediately *and* after a reset. An embedder that deliberately wants
+ * to change only the reset value can read the live value with
+ * ghostty_terminal_mode_get() first and restore it with
+ * ghostty_terminal_mode_set() afterwards.
+ *
+ * Call this before feeding any data to the terminal. It is intended for
+ * applying embedder configuration, not for reacting to terminal output: a
+ * default that changes while a remote application is running is
+ * indistinguishable, to that application, from the terminal lying about what
+ * it supports.
+ *
+ * Only the named mode is affected; every other mode keeps both its current
+ * and its default value. The saved value used by XTSAVE/XTRESTORE
+ * (`CSI ? Pm s` / `CSI ? Pm r`) is not touched, so a mode saved before this
+ * call still restores to the value it had when it was saved. A reset clears
+ * the saved values, as it always does.
+ *
+ * DECRQM (`CSI ? Pm $ p`) reports the live value, so it reflects this call
+ * immediately, and reports the same value again after a reset.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param mode The mode identifying the mode to set
+ * @param value true to set the mode, false to reset it
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if the terminal
+ *         is NULL or the mode does not correspond to a known mode
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_mode_set_default(GhosttyTerminal terminal,
+                                                GhosttyMode mode,
+                                                bool value);
+
+/**
  * Get data from a terminal instance.
  *
  * Extracts typed data from the given terminal based on the specified
