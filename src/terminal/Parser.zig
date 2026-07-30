@@ -75,7 +75,9 @@ pub const Action = union(enum) {
     /// APC data
     apc_start: void,
     apc_put: u8,
-    apc_end: void,
+    /// True if the string was not properly terminated by ST, in which
+    /// case the buffered command must be discarded rather than executed.
+    apc_end: bool,
 
     pub const CSI = struct {
         intermediates: []u8,
@@ -219,10 +221,16 @@ param_acc_idx: u8,
 /// Parser for OSC sequences
 osc_parser: osc.Parser,
 
+/// Set when an APC string ended at an ESC. Such a string is only properly
+/// terminated if that escape sequence turns out to be ST, so apc_end is
+/// held back until the sequence resolves.
+apc_end_pending: bool,
+
 pub fn init() Parser {
     var result: Parser = .{
         .state = .ground,
         .intermediates_idx = 0,
+        .apc_end_pending = false,
         .params_sep = .initEmpty(),
         .params_idx = 0,
         .param_acc = 0,
@@ -272,7 +280,14 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
             else
                 null,
             .dcs_passthrough => Action{ .dcs_unhook = {} },
-            .sos_pm_apc_string => Action{ .apc_end = {} },
+            .sos_pm_apc_string => if (next_state == .escape) defer_end: {
+                self.apc_end_pending = true;
+                break :defer_end null;
+            } else Action{ .apc_end = c != 0x9C },
+            .escape => if (self.apc_end_pending) resolve_end: {
+                self.apc_end_pending = false;
+                break :resolve_end Action{ .apc_end = c != '\\' };
+            } else null,
             else => null,
         },
 

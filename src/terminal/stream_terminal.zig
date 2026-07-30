@@ -320,7 +320,10 @@ pub const Handler = struct {
             .apc_start => self.apc_handler.start(),
             .apc_put => self.apc_handler.feed(self.terminal.gpa(), value),
             .apc_put_slice => self.apc_handler.feedSlice(self.terminal.gpa(), value.bytes),
-            .apc_end => self.apcEnd(),
+            .apc_end => if (value)
+                self.apc_handler.cancel()
+            else
+                self.apcEnd(),
 
             // Effect-based handlers
             .bell => self.bell(),
@@ -1557,6 +1560,52 @@ test "glyph protocol APC with write_pty callback" {
 
     s.nextSlice("\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\");
     try testing.expectEqualStrings("\x1B_25a1;r;cp=e0a0;status=0\x1B\\", S.last_response.?);
+    try testing.expect(t.glyph_glossary.contains(0xE0A0));
+}
+
+test "canceled glyph registrations do not mutate glossary or write a response" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var response_calls: usize = 0;
+        fn writePty(_: *Handler, _: [:0]const u8) void {
+            response_calls += 1;
+        }
+    };
+    S.response_calls = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    s.nextSlice("\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x18");
+    s.nextSlice("\x1B_25a1;r;cp=e0a1;AAAAAAAAAAAAAA==\x1A");
+    try testing.expect(!t.glyph_glossary.contains(0xE0A0));
+    try testing.expect(!t.glyph_glossary.contains(0xE0A1));
+    try testing.expectEqual(@as(usize, 0), S.response_calls);
+
+    // Cancellation must leave the handler ready for the next valid APC.
+    s.nextSlice("\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\");
+    try testing.expect(t.glyph_glossary.contains(0xE0A0));
+    try testing.expectEqual(@as(usize, 1), S.response_calls);
+}
+
+test "a glyph clear cut short by the next sequence does not clear the glossary" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .init(&t));
+    defer s.deinit();
+
+    s.nextSlice("\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\");
+    try testing.expect(t.glyph_glossary.contains(0xE0A0));
+
+    // Cut before "cp=" completes, so the buffered command is a bare clear
+    // that would empty the whole glossary if it were executed.
+    s.nextSlice("\x1B_25a1;c;cp");
+    s.nextSlice("\x1B[0m");
     try testing.expect(t.glyph_glossary.contains(0xE0A0));
 }
 

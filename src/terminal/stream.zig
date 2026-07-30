@@ -109,7 +109,8 @@ pub const Action = union(Key) {
     dcs_put: u8,
     dcs_unhook,
     apc_start,
-    apc_end,
+    /// True if the APC string was not properly terminated by ST.
+    apc_end: bool,
     apc_put: u8,
     apc_put_slice: ApcPutSlice,
     end_hyperlink,
@@ -652,8 +653,12 @@ pub fn Stream(comptime H: type) type {
                 // Fast path for CSI entry: "ESC [" is by far the most
                 // common escape sequence prefix, so handle the '[' and
                 // the byte that follows it here rather than paying a
-                // nextNonUtf8 call for each.
-                if (self.parser.state == .escape and input[offset] == '[') {
+                // nextNonUtf8 call for each. A pending apc_end has to
+                // go through the state machine to be dispatched.
+                if (self.parser.state == .escape and
+                    input[offset] == '[' and
+                    !self.parser.apc_end_pending)
+                {
                     self.parser.state = .csi_entry;
                     offset += 1;
                     continue;
@@ -917,8 +922,12 @@ pub fn Stream(comptime H: type) type {
         fn nextNonUtf8(self: *Self, c: u8) void {
             assert(self.parser.state != .ground);
 
-            // Fast path for CSI entry.
-            if (self.parser.state == .escape and c == '[') {
+            // Fast path for CSI entry. A pending apc_end has to go
+            // through the state machine to be dispatched.
+            if (self.parser.state == .escape and
+                c == '[' and
+                !self.parser.apc_end_pending)
+            {
                 self.parser.state = .csi_entry;
                 return;
             }
@@ -1025,7 +1034,7 @@ pub fn Stream(comptime H: type) type {
                     .dcs_unhook => self.handler.vt(.dcs_unhook, {}),
                     .apc_start => self.handler.vt(.apc_start, {}),
                     .apc_put => |code| self.handler.vt(.apc_put, code),
-                    .apc_end => self.handler.vt(.apc_end, {}),
+                    .apc_end => |canceled| self.handler.vt(.apc_end, canceled),
                 }
             }
         }
@@ -3863,6 +3872,7 @@ const ApcTestHandler = struct {
     puts: usize = 0,
     started: usize = 0,
     ended: usize = 0,
+    canceled: usize = 0,
 
     pub fn vt(
         self: *@This(),
@@ -3871,7 +3881,10 @@ const ApcTestHandler = struct {
     ) void {
         switch (action) {
             .apc_start => self.started += 1,
-            .apc_end => self.ended += 1,
+            .apc_end => {
+                self.ended += 1;
+                if (value) self.canceled += 1;
+            },
             .apc_put => {
                 self.buf[self.len] = value;
                 self.len += 1;
@@ -3937,10 +3950,54 @@ test "stream: apc aborted by CAN" {
 
     try testing.expectEqual(@as(usize, 1), s.handler.started);
     try testing.expectEqual(@as(usize, 1), s.handler.ended);
+    try testing.expectEqual(@as(usize, 1), s.handler.canceled);
     try testing.expectEqualStrings(
         "Gabcdefghijklmnopqrstuvwxyz0123456789",
         s.handler.buf[0..s.handler.len],
     );
+}
+
+test "stream: apc aborted by SUB" {
+    var s: Stream(ApcTestHandler) = .init(.{});
+    s.nextSlice("\x1b_Gabcdefghijklmnopqrstuvwxyz0123456789\x1adef");
+
+    try testing.expectEqual(@as(usize, 1), s.handler.started);
+    try testing.expectEqual(@as(usize, 1), s.handler.ended);
+    try testing.expectEqual(@as(usize, 1), s.handler.canceled);
+    try testing.expectEqualStrings(
+        "Gabcdefghijklmnopqrstuvwxyz0123456789",
+        s.handler.buf[0..s.handler.len],
+    );
+}
+
+test "stream: apc terminated by another escape sequence" {
+    var s: Stream(ApcTestHandler) = .init(.{});
+    s.nextSlice("\x1b_Gabcdefghijklmnopqrstuvwxyz0123456789\x1b[0m");
+
+    try testing.expectEqual(@as(usize, 1), s.handler.started);
+    try testing.expectEqual(@as(usize, 1), s.handler.ended);
+    try testing.expectEqual(@as(usize, 1), s.handler.canceled);
+    try testing.expectEqualStrings(
+        "Gabcdefghijklmnopqrstuvwxyz0123456789",
+        s.handler.buf[0..s.handler.len],
+    );
+}
+
+test "stream: apc terminated by C1 ST" {
+    var s: Stream(ApcTestHandler) = .init(.{});
+    s.nextSlice("\x1b_Gabc\x9c");
+
+    try testing.expectEqual(@as(usize, 1), s.handler.ended);
+    try testing.expectEqual(@as(usize, 0), s.handler.canceled);
+}
+
+test "stream: apc interrupted by another apc" {
+    var s: Stream(ApcTestHandler) = .init(.{});
+    s.nextSlice("\x1b_Gabc\x1b_Gdef\x1b\\");
+
+    try testing.expectEqual(@as(usize, 2), s.handler.started);
+    try testing.expectEqual(@as(usize, 2), s.handler.ended);
+    try testing.expectEqual(@as(usize, 1), s.handler.canceled);
 }
 
 test "stream: apc scalar path matches" {
@@ -3958,13 +4015,16 @@ test "stream: apc scalar path matches" {
 test "stream: apc vector boundaries match scalar path" {
     const positions = [_]usize{ 15, 16, 17, 31, 32, 33, 63, 64, 65 };
     const controls = [_]u8{ 0x18, 0x1A, 0x1B, 0x80, 0xFF };
+    // After ESC, '\\' is ST and '[' starts an unrelated sequence, so the
+    // two resolve a deferred apc_end differently.
+    const finals = [_]u8{ '\\', '[' };
 
-    for (positions) |position| for (controls) |control| {
+    for (positions) |position| for (controls) |control| for (finals) |final| {
         var input: [96]u8 = undefined;
         input[0..3].* = "\x1b_G".*;
         @memset(input[3 .. 3 + position], 'a');
         input[3 + position] = control;
-        input[4 + position] = '\\';
+        input[4 + position] = final;
         const bytes = input[0 .. 5 + position];
 
         var bulk: Stream(ApcTestHandler) = .init(.{});
@@ -3974,6 +4034,7 @@ test "stream: apc vector boundaries match scalar path" {
 
         try testing.expectEqual(scalar.handler.started, bulk.handler.started);
         try testing.expectEqual(scalar.handler.ended, bulk.handler.ended);
+        try testing.expectEqual(scalar.handler.canceled, bulk.handler.canceled);
         try testing.expectEqualStrings(
             scalar.handler.buf[0..scalar.handler.len],
             bulk.handler.buf[0..bulk.handler.len],

@@ -186,6 +186,12 @@ pub const Handler = struct {
             },
         };
     }
+
+    /// Discard the in-progress command instead of executing it.
+    pub fn cancel(self: *Handler) void {
+        self.state.deinit();
+        self.state = .inactive;
+    }
 };
 
 pub const State = union(enum) {

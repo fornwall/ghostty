@@ -349,7 +349,10 @@ pub const StreamHandler = struct {
             .dcs_put => try self.dcsPut(value),
             .dcs_unhook => try self.dcsUnhook(),
             .apc_start => self.apc.start(),
-            .apc_end => try self.apcEnd(),
+            .apc_end => if (value)
+                self.apc.cancel()
+            else
+                try self.apcEnd(),
             .apc_put => self.apc.feed(self.alloc, value),
             .apc_put_slice => self.apc.feedSlice(self.alloc, value.bytes),
 
