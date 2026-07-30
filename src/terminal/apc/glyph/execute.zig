@@ -46,6 +46,11 @@ fn query(
     qry: Request.Query,
 ) ?Response {
     const cp = qry.get(.cp) orelse return null;
+    // `cp` is parsed into u21 so malformed wide integers are rejected, but a
+    // u21 can still contain values outside Unicode or UTF-16 surrogate code
+    // points. These are not renderable codepoints and must not reach an
+    // embedder font API.
+    if (cp > 0x10ffff or (cp >= 0xd800 and cp <= 0xdfff)) return null;
     return .{ .query = .{
         .cp = cp,
         .status = .{

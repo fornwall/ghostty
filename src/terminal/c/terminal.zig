@@ -122,6 +122,7 @@ const Effects = struct {
     progress_report: ?ProgressReportFn = null,
     size_cb: ?SizeFn = null,
     clipboard_write: ?ClipboardWriteFn = null,
+    glyph_coverage: ?GlyphCoverageFn = null,
 
     /// Scratch buffer for DA1 feature codes. The device attributes
     /// trampoline converts C feature codes into this buffer and returns
@@ -180,6 +181,9 @@ const Effects = struct {
     /// Returns true and fills out_size if size is available,
     /// or returns false to silently ignore the query.
     pub const SizeFn = *const fn (Terminal, ?*anyopaque, *size_report.Size) callconv(lib.calling_conv) bool;
+
+    /// C function pointer type for Glyph Protocol system-font coverage.
+    pub const GlyphCoverageFn = *const fn (Terminal, ?*anyopaque, u32) callconv(lib.calling_conv) bool;
 
     /// C function pointer type for the device_attributes callback.
     /// Returns true and fills out_attrs if attributes are available,
@@ -374,6 +378,12 @@ const Effects = struct {
         if (func(@ptrCast(wrapper), wrapper.effects.userdata, &s)) return s;
         return null;
     }
+
+    fn glyphCoverageTrampoline(handler: *Handler, cp: u21) bool {
+        const wrapper = TerminalWrapper.fromHandler(handler);
+        const func = wrapper.effects.glyph_coverage orelse return false;
+        return func(@ptrCast(wrapper), wrapper.effects.userdata, cp);
+    }
 };
 
 /// C: GhosttyTerminal
@@ -468,6 +478,7 @@ fn new_(
         .progress_report = &Effects.progressReportTrampoline,
         .size = &Effects.sizeTrampoline,
         .clipboard_write = &Effects.clipboardWriteTrampoline,
+        .glyph_coverage = &Effects.glyphCoverageTrampoline,
     };
 
     wrapper.* = .{
@@ -545,6 +556,7 @@ pub const Option = enum(c_int) {
     desktop_notification = 29,
     progress_report = 30,
     terminfo_name = 31,
+    glyph_coverage = 32,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -561,6 +573,7 @@ pub const Option = enum(c_int) {
             .title_changed => ?Effects.TitleChangedFn,
             .pwd_changed => ?Effects.PwdChangedFn,
             .progress_report => ?Effects.ProgressReportFn,
+            .glyph_coverage => ?Effects.GlyphCoverageFn,
             .size_cb => ?Effects.SizeFn,
             .clipboard_write => ?Effects.ClipboardWriteFn,
             .title, .pwd => ?*const lib.String,
@@ -625,6 +638,7 @@ fn setTyped(
         .title_changed => wrapper.effects.title_changed = value,
         .pwd_changed => wrapper.effects.pwd_changed = value,
         .progress_report => wrapper.effects.progress_report = value,
+        .glyph_coverage => wrapper.effects.glyph_coverage = value,
         .size_cb => wrapper.effects.size_cb = value,
         .clipboard_write => wrapper.effects.clipboard_write = value,
         .title => {
@@ -4369,6 +4383,60 @@ test "set glyph protocol disables APC handling and clears glossary" {
     try testing.expectEqual(Result.success, set(t, .glyph_protocol, @ptrCast(&enabled)));
     vt_write(t, register, register.len);
     try testing.expect(t.?.terminal.glyph_glossary.contains(0xE0A0));
+}
+
+test "set glyph coverage callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var count: usize = 0;
+        var last_userdata: ?*anyopaque = null;
+        var last_codepoint: u32 = 0;
+
+        fn glyphCoverage(
+            _: Terminal,
+            userdata: ?*anyopaque,
+            codepoint: u32,
+        ) callconv(lib.calling_conv) bool {
+            count += 1;
+            last_userdata = userdata;
+            last_codepoint = codepoint;
+            return codepoint == 0xE0A0;
+        }
+    };
+    S.count = 0;
+    S.last_userdata = null;
+    S.last_codepoint = 0;
+
+    var sentinel: u8 = 101;
+    try testing.expectEqual(Result.success, set(t, .userdata, @ptrCast(&sentinel)));
+    try testing.expectEqual(Result.success, set(
+        t,
+        .glyph_coverage,
+        @ptrCast(&S.glyphCoverage),
+    ));
+
+    try testing.expect(t.?.stream.handler.effects.glyph_coverage.?(
+        &t.?.stream.handler,
+        0xE0A0,
+    ));
+    try testing.expectEqual(@as(usize, 1), S.count);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
+    try testing.expectEqual(@as(u32, 0xE0A0), S.last_codepoint);
+
+    try testing.expectEqual(Result.success, set(t, .glyph_coverage, null));
+    try testing.expect(!t.?.stream.handler.effects.glyph_coverage.?(
+        &t.?.stream.handler,
+        0xE0A0,
+    ));
+    try testing.expectEqual(@as(usize, 1), S.count);
 }
 
 test "get_multi success" {

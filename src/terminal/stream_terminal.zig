@@ -141,6 +141,11 @@ pub const Handler = struct {
         /// call. Empty or over-long names are silently ignored.
         terminfo_name: ?*const fn (*Handler) []const u8,
 
+        /// Returns whether the embedder's system font fallback can render a
+        /// Glyph Protocol `q` codepoint. Called only for a valid query whose
+        /// response can be written to the pty.
+        glyph_coverage: ?*const fn (*Handler, u21) bool,
+
         /// No effects means that the stream effectively becomes readonly
         /// that only affects pure terminal state and ignores all side
         /// effects beyond that.
@@ -151,6 +156,7 @@ pub const Handler = struct {
             .desktop_notification = null,
             .device_attributes = null,
             .enquiry = null,
+            .glyph_coverage = null,
             .progress_report = null,
             .size = null,
             .title_changed = null,
@@ -993,10 +999,18 @@ pub const Handler = struct {
 
             .glyph => |*glyph_req| {
                 const resp = self.terminal.glyphProtocol(alloc, glyph_req);
-                if (resp) |r| resp_block: {
+                if (resp) |value| resp_block: {
                     // Don't waste time encoding if we can't write responses
                     // anyways.
                     if (self.effects.write_pty == null) break :resp_block;
+
+                    var r = value;
+                    switch (r) {
+                        .query => |*query| if (self.effects.glyph_coverage) |coverage| {
+                            query.status.system = coverage(self, query.cp);
+                        },
+                        else => {},
+                    }
 
                     // Glyph responses are short and bounded by the protocol
                     // fields we emit, so this matches the Kitty response
@@ -1759,26 +1773,87 @@ test "glyph protocol APC with write_pty callback" {
 
     const S = struct {
         var last_response: ?[:0]const u8 = null;
+        var coverage_calls: usize = 0;
+        var last_codepoint: u21 = 0;
         fn writePty(_: *Handler, data: [:0]const u8) void {
             if (last_response) |old| testing.allocator.free(old);
             last_response = testing.allocator.dupeZ(u8, data) catch @panic("OOM");
         }
+        fn glyphCoverage(_: *Handler, cp: u21) bool {
+            coverage_calls += 1;
+            last_codepoint = cp;
+            return cp == 0xE0A0;
+        }
     };
     S.last_response = null;
+    S.coverage_calls = 0;
+    S.last_codepoint = 0;
     defer if (S.last_response) |old| testing.allocator.free(old);
 
     var handler: Handler = .init(&t);
     handler.effects.write_pty = &S.writePty;
+    handler.effects.glyph_coverage = &S.glyphCoverage;
 
     var s: Stream = .initAlloc(testing.allocator, handler);
     defer s.deinit();
 
     s.nextSlice("\x1B_25a1;s\x1B\\");
     try testing.expectEqualStrings("\x1B_25a1;s;fmt=glyf\x1B\\", S.last_response.?);
+    try testing.expectEqual(@as(usize, 0), S.coverage_calls);
+
+    s.nextSlice("\x1B_25a1;q;cp=e0a0\x1B\\");
+    try testing.expectEqualStrings(
+        "\x1B_25a1;q;cp=e0a0;status=system\x1B\\",
+        S.last_response.?,
+    );
+    try testing.expectEqual(@as(usize, 1), S.coverage_calls);
+    try testing.expectEqual(@as(u21, 0xE0A0), S.last_codepoint);
+
+    s.nextSlice("\x1B_25a1;q;cp=f0000\x1B\\");
+    try testing.expectEqualStrings(
+        "\x1B_25a1;q;cp=f0000;status=\x1B\\",
+        S.last_response.?,
+    );
+    try testing.expectEqual(@as(usize, 2), S.coverage_calls);
 
     s.nextSlice("\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\");
     try testing.expectEqualStrings("\x1B_25a1;r;cp=e0a0;status=0\x1B\\", S.last_response.?);
     try testing.expect(t.glyph_glossary.contains(0xE0A0));
+    try testing.expectEqual(@as(usize, 2), S.coverage_calls);
+
+    s.nextSlice("\x1B_25a1;q;cp=e0a0\x1B\\");
+    try testing.expectEqualStrings(
+        "\x1B_25a1;q;cp=e0a0;status=system,glossary\x1B\\",
+        S.last_response.?,
+    );
+    try testing.expectEqual(@as(usize, 3), S.coverage_calls);
+
+    // Invalid Unicode scalars are declined before consulting the embedder.
+    s.nextSlice("\x1B_25a1;q;cp=d800\x1B\\");
+    s.nextSlice("\x1B_25a1;q;cp=110000\x1B\\");
+    try testing.expectEqual(@as(usize, 3), S.coverage_calls);
+}
+
+test "glyph coverage is not queried when responses cannot be written" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var coverage_calls: usize = 0;
+        fn glyphCoverage(_: *Handler, _: u21) bool {
+            coverage_calls += 1;
+            return true;
+        }
+    };
+    S.coverage_calls = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.glyph_coverage = &S.glyphCoverage;
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    s.nextSlice("\x1B_25a1;q;cp=e0a0\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.coverage_calls);
 }
 
 test "ignores query actions" {

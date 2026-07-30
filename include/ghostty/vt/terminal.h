@@ -97,6 +97,7 @@ extern "C" {
  * | `GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE`  | `GhosttyTerminalClipboardWriteFn` | Clipboard write via OSC 52 / OSC 1337     |
  * | `GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION`| `GhosttyTerminalDesktopNotificationFn` | Desktop notification via OSC 9 / OSC 777 |
  * | `GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT`  | `GhosttyTerminalProgressReportFn` | Progress report via OSC 9;4               |
+ * | `GHOSTTY_TERMINAL_OPT_GLYPH_COVERAGE`   | `GhosttyTerminalGlyphCoverageFn`  | Glyph Protocol system-font query          |
  *
  * ### Defining a write_pty callback
  * @snippet c-vt-effects/src/main.c effects-write-pty
@@ -619,6 +620,25 @@ typedef bool (*GhosttyTerminalSizeFn)(GhosttyTerminal terminal,
                                       GhosttySizeReportSize* out_size);
 
 /**
+ * Callback function type for Glyph Protocol system-font coverage queries.
+ *
+ * Called synchronously for a valid Glyph Protocol `q` request when a response
+ * can be written to the pty. Return true when the embedder's normal system font
+ * fallback can render the Unicode codepoint. Registered glossary coverage is
+ * tracked independently by the terminal.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ * @param codepoint The queried codepoint
+ * @return true if a system font can render the codepoint
+ *
+ * @ingroup terminal
+ */
+typedef bool (*GhosttyTerminalGlyphCoverageFn)(GhosttyTerminal terminal,
+                                                void* userdata,
+                                                uint32_t codepoint);
+
+/**
  * Callback function type for title_changed.
  *
  * Called when the terminal title changes via escape sequences
@@ -1065,6 +1085,14 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyTerminalTerminfoNameFn
    */
   GHOSTTY_TERMINAL_OPT_TERMINFO_NAME = 31,
+
+  /**
+   * Callback invoked for Glyph Protocol `q` system-font coverage. Set to NULL
+   * to report only terminal glossary coverage.
+   *
+   * Input type: GhosttyTerminalGlyphCoverageFn
+   */
+  GHOSTTY_TERMINAL_OPT_GLYPH_COVERAGE = 32,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
