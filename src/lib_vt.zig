@@ -141,6 +141,29 @@ pub const unicode = struct {
     pub const graphemeWidth = unicode_pkg.graphemeWidth;
 };
 
+/// Runtime glyph registrations and rasterization.
+///
+/// This is a Zig-only API while Glyph Protocol rendering is still evolving.
+pub const glyph = struct {
+    const FontGlyph = @import("font/Glyph.zig");
+    const rasterizer = @import("font/glyf_rasterize.zig");
+
+    pub const Bitmap = rasterizer.Bitmap;
+    pub const Entry = terminal.apc.glyph.Glossary.Entry;
+    pub const Metrics = @import("font/Metrics.zig");
+    pub const RenderOptions = FontGlyph.RenderOptions;
+
+    pub fn generation(t: *const Terminal) u64 {
+        return t.glyph_glossary.revision;
+    }
+
+    pub fn entry(t: *const Terminal, cp: u21) ?*const Entry {
+        return t.glyph_glossary.get(cp);
+    }
+
+    pub const rasterize = rasterizer.rasterize;
+};
+
 /// Used for MSVC builds (see below)
 var msvc_fltused: c_int = 1;
 

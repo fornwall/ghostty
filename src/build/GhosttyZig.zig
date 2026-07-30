@@ -137,6 +137,14 @@ fn initVt(
     // We need uucode for grapheme break support
     vt.addImport("uucode", deps.uucode_mod);
 
+    // The Zig Glyph Protocol API exposes the alpha8 glyf rasterizer.
+    if (b.lazyDependency("z2d", .{
+        .target = cfg.target,
+        .optimize = cfg.optimize,
+    })) |dep| {
+        vt.addImport("z2d", dep.module("z2d"));
+    }
+
     // If SIMD is enabled, add all our SIMD dependencies.
     if (cfg.simd) {
         try SharedDeps.addSimd(b, vt, simd_libs);
