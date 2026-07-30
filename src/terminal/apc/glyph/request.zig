@@ -6,6 +6,11 @@ const Glyf = @import("../../../font/opentype/glyf.zig").Glyf;
 /// Maximum decoded glyph payload size accepted by the protocol.
 /// This is documented in the spec.
 const max_payload_size = 64 * 1024; // 64 KiB
+/// Work bounds for untrusted simple-glyph outlines. These are deliberately
+/// generous compared with normal icon fonts while preventing compact glyf RLE
+/// flags from expanding into 65,536-point rasterization jobs.
+pub const max_glyf_contours = 256;
+pub const max_glyf_points = 4096;
 
 /// Stateful parser for a single glyph APC payload after the `25a1;` prefix.
 pub const CommandParser = struct {
@@ -299,7 +304,10 @@ pub const Request = union(enum) {
             // decode call below. Glyf.Entry.decode returns an owned Outline, so
             // it is safe to free `data` before returning that outline.
             const glyf_entry = Glyf.Entry.init(data) catch return error.MalformedPayload;
-            return glyf_entry.decode(alloc) catch |err| switch (err) {
+            return glyf_entry.decodeWithLimits(alloc, .{
+                .max_contours = max_glyf_contours,
+                .max_points = max_glyf_points,
+            }) catch |err| switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 // Unsupported fields
                 error.CompositeNotSupported => error.CompositeUnsupported,
@@ -310,6 +318,7 @@ pub const Request = union(enum) {
                 error.EndPointsOutOfOrder,
                 error.TooManyPoints,
                 error.CoordinateOverflow,
+                error.ComplexityLimitExceeded,
                 => error.MalformedPayload,
             };
         }
@@ -804,6 +813,75 @@ test "register rejects malformed glyf payload" {
     defer cmd.deinit(testing.allocator);
 
     try testing.expectError(error.MalformedPayload, cmd.register.decodeGlyfPayload(testing.allocator));
+}
+
+test "register rejects compact glyf point expansion above complexity limit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // One contour ending at u16 max declares 65,536 logical points. Repeat
+    // flags encode all of them in only 512 bytes, so the 64 KiB decoded-payload
+    // limit alone does not bound allocation or raster work.
+    var glyf: std.ArrayList(u8) = .empty;
+    defer glyf.deinit(alloc);
+    try glyf.appendSlice(alloc, &.{
+        0x00, 0x01, // numberOfContours = 1
+        0x00, 0x00, 0x00, 0x00, // xMin, yMin
+        0x00, 0x00, 0x00, 0x00, // xMax, yMax
+        0xff, 0xff, // endPtsOfContours[0] = 65535
+        0x00, 0x00, // instructionLength = 0
+    });
+    for (0..256) |_| {
+        // On-curve, repeated, with unchanged x and y; 256 logical points.
+        try glyf.appendSlice(alloc, &.{ 0x39, 0xff });
+    }
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(glyf.items.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, glyf.items);
+    const wire = try std.fmt.allocPrint(alloc, "r;cp=e0a0;{s}", .{encoded});
+    defer alloc.free(wire);
+
+    var cmd = try testParse(alloc, wire);
+    defer cmd.deinit(alloc);
+    try testing.expectError(
+        error.MalformedPayload,
+        cmd.register.decodeGlyfPayload(alloc),
+    );
+}
+
+test "register rejects glyf contour count above complexity limit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const contour_count = max_glyf_contours + 1;
+
+    var glyf: std.ArrayList(u8) = .empty;
+    defer glyf.deinit(alloc);
+    var field: [2]u8 = undefined;
+    std.mem.writeInt(i16, &field, @intCast(contour_count), .big);
+    try glyf.appendSlice(alloc, &field);
+    try glyf.appendNTimes(alloc, 0, 8); // bounds
+    for (0..contour_count) |index| {
+        std.mem.writeInt(u16, &field, @intCast(index), .big);
+        try glyf.appendSlice(alloc, &field);
+    }
+    try glyf.appendSlice(alloc, &.{ 0, 0 }); // instructionLength
+    try glyf.appendNTimes(alloc, 0x31, contour_count); // on-curve, unchanged x/y
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(glyf.items.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, glyf.items);
+    const wire = try std.fmt.allocPrint(alloc, "r;cp=e0a0;{s}", .{encoded});
+    defer alloc.free(wire);
+
+    var cmd = try testParse(alloc, wire);
+    defer cmd.deinit(alloc);
+    try testing.expectError(
+        error.MalformedPayload,
+        cmd.register.decodeGlyfPayload(alloc),
+    );
 }
 
 test "register response without payload" {

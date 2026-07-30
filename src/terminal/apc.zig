@@ -243,9 +243,9 @@ pub const Protocol = enum {
             // encoded as base64), so the default is set to 65 MiB.
             .kitty => 65 * 1024 * 1024,
             // Glyph protocol messages carry single glyf outlines which
-            // are small, but base64 encoding inflates them. 1 MiB is
-            // generous for any single simple-glyph record.
-            .glyph => 1 * 1024 * 1024,
+            // are capped at 64 KiB decoded. 128 KiB leaves room for base64
+            // expansion and options while bounding parser memory and work.
+            .glyph => 128 * 1024,
         };
     }
 };
@@ -508,6 +508,21 @@ test "feedSlice kitty max bytes exceeded" {
     try testing.expect(h.state != .ignore);
     h.feedSlice(alloc, "e");
     try testing.expect(h.state == .ignore);
+}
+
+test "feedSlice glyph max bytes exceeded" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var h: Handler = .{ .max_bytes = .init(.{ .glyph = 4 }) };
+    defer h.deinit();
+    h.start();
+    h.feedSlice(alloc, "25a1;q;cp");
+    try testing.expect(h.state != .ignore);
+    h.feedSlice(alloc, "=");
+    try testing.expect(h.state == .ignore);
+    h.feedSlice(alloc, "unbounded bytes are dropped without allocation");
+    try testing.expect(h.end() == null);
 }
 
 test "disabled glyph command is ignored" {

@@ -95,6 +95,20 @@ pub const EraseLine = terminal.EraseLine;
 pub const TabClear = terminal.TabClear;
 pub const Attribute = terminal.Attribute;
 
+/// Return the Zig terminal behind an opaque libghostty-vt C handle.
+///
+/// This compiler-checked bridge is available only to Zig embedders that import
+/// the C-ABI module. The handle's lifetime and synchronization requirements
+/// remain identical to the public C API.
+pub fn terminalFromCHandle(handle: ?*anyopaque) ?*Terminal {
+    if (comptime !terminal.options.c_abi) {
+        @compileError("terminalFromCHandle requires the ghostty-vt-c module");
+    }
+    const c_terminal: terminal.c_api.terminal.Terminal =
+        @ptrCast(@alignCast(handle));
+    return terminal.c_api.terminal.zigTerminal(c_terminal);
+}
+
 /// Terminal-specific input encoding is also part of libghostty-vt.
 pub const input = struct {
     // We have to be careful to only import targeted files within
@@ -139,6 +153,36 @@ pub const unicode = struct {
 
     pub const codepointWidth = unicode_pkg.codepointWidth;
     pub const graphemeWidth = unicode_pkg.graphemeWidth;
+};
+
+/// Runtime glyph registrations and rasterization.
+///
+/// This is a Zig-only API while Glyph Protocol rendering is still evolving.
+/// In C-ABI builds, `terminalFromCHandle` is the compiler-checked bridge from
+/// the opaque C wrapper to its underlying Zig terminal. Callers must continue
+/// to obey the C handle's lifetime and synchronization rules.
+pub const glyph = struct {
+    const FontGlyph = @import("font/Glyph.zig");
+    const rasterizer = @import("font/glyf_rasterize.zig");
+
+    pub const Bitmap = rasterizer.Bitmap;
+    pub const Entry = terminal.apc.glyph.Glossary.Entry;
+    pub const Metrics = @import("font/Metrics.zig");
+    pub const RenderOptions = FontGlyph.RenderOptions;
+
+    pub fn terminalFromCHandle(handle: ?*anyopaque) ?*Terminal {
+        return lib.terminalFromCHandle(handle);
+    }
+
+    pub fn generation(t: *const Terminal) u64 {
+        return t.glyph_glossary.revision;
+    }
+
+    pub fn entry(t: *const Terminal, cp: u21) ?*const Entry {
+        return t.glyph_glossary.get(cp);
+    }
+
+    pub const rasterize = rasterizer.rasterize;
 };
 
 /// Used for MSVC builds (see below)

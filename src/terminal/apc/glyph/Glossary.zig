@@ -21,7 +21,10 @@ const Constraint = FontGlyph.RenderOptions.Constraint;
 pub const max_entries = 1024;
 
 /// An empty glossary with no registered glyphs.
-pub const empty: Glossary = .{ .entries = .empty };
+pub const empty: Glossary = .{
+    .entries = .empty,
+    .revision = 0,
+};
 
 /// Errors that can occur while registering a glossary entry.
 pub const RegisterError = Allocator.Error || error{OutOfNamespace};
@@ -41,6 +44,13 @@ pub const ClearError = error{OutOfNamespace};
 /// for a session will be rare, so the eviction cost shouldn't
 /// happen regularly.
 entries: std.AutoArrayHashMapUnmanaged(u21, Entry),
+
+/// Monotonically changes whenever the live registration set changes.
+///
+/// Renderers use this to invalidate rasterized glyphs after registration,
+/// overwrite, eviction, or clear. A wrapping counter is sufficient because a
+/// renderer cannot retain 2^64 distinct intervening glossary states.
+revision: u64,
 
 /// Release all glyph entries and hash map storage owned by the glossary.
 pub fn deinit(self: *Glossary, alloc: Allocator) void {
@@ -72,6 +82,7 @@ pub fn register(
         // We already had enough capacity for this key before removing it, so
         // reinserting the replacement cannot require another allocation.
         self.entries.putAssumeCapacity(cp, entry);
+        self.revision +%= 1;
         return;
     }
 
@@ -79,11 +90,15 @@ pub fn register(
     gop.value_ptr.* = entry;
 
     // Fast, typical path: we fit within the glossary, just return.
-    if (self.entries.count() <= max_entries) return;
+    if (self.entries.count() <= max_entries) {
+        self.revision +%= 1;
+        return;
+    }
 
     // Slow path: we need to evict.
     self.entries.values()[0].deinit(alloc);
     self.entries.orderedRemoveAt(0);
+    self.revision +%= 1;
 }
 
 /// Delete a single entry from the glossary. If the entry doesn't exist,
@@ -97,19 +112,29 @@ pub fn delete(
     const kv = self.entries.fetchOrderedRemove(cp) orelse return;
     var entry = kv.value;
     entry.deinit(alloc);
+    self.revision +%= 1;
 }
 
 /// Clear all entries from the glossary and free up any underlying
 /// storage.
 pub fn clearAndFree(self: *Glossary, alloc: Allocator) void {
+    const changed = self.entries.count() > 0;
     for (self.entries.values()) |*entry| entry.deinit(alloc);
     self.entries.deinit(alloc);
     self.entries = .empty;
+    if (changed) self.revision +%= 1;
 }
 
 /// Contains returns true if the codepoint is covered by the glossary.
-pub fn contains(self: *Glossary, cp: u21) bool {
+pub fn contains(self: *const Glossary, cp: u21) bool {
     return self.entries.contains(cp);
+}
+
+/// Return a live registration, if any.
+///
+/// The pointer is invalidated by any glossary mutation.
+pub fn get(self: *const Glossary, cp: u21) ?*const Entry {
+    return self.entries.getPtr(cp);
 }
 
 /// A single glyph registration entry.
@@ -427,6 +452,55 @@ test "Glossary clearAndFree removes all slots and remains reusable" {
     try glossary.register(alloc, 0xE002, try testRegisterEntry(alloc, 0xE002));
     try testing.expectEqual(@as(usize, 1), glossary.entries.count());
     try testing.expect(glossary.contains(0xE002));
+}
+
+test "Glossary revision changes only when registrations change" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var glossary: Glossary = .empty;
+    defer glossary.deinit(alloc);
+
+    try testing.expectEqual(@as(u64, 0), glossary.revision);
+    try glossary.delete(alloc, 0xE000);
+    try testing.expectEqual(@as(u64, 0), glossary.revision);
+    glossary.clearAndFree(alloc);
+    try testing.expectEqual(@as(u64, 0), glossary.revision);
+
+    try glossary.register(alloc, 0xE000, try testRegisterEntry(alloc, 0xE000));
+    try testing.expectEqual(@as(u64, 1), glossary.revision);
+    try testing.expect(glossary.get(0xE000) != null);
+
+    try glossary.register(alloc, 0xE000, try testRegisterEntry(alloc, 0xE000));
+    try testing.expectEqual(@as(u64, 2), glossary.revision);
+
+    try glossary.delete(alloc, 0xE001);
+    try testing.expectEqual(@as(u64, 2), glossary.revision);
+    try glossary.delete(alloc, 0xE000);
+    try testing.expectEqual(@as(u64, 3), glossary.revision);
+
+    try glossary.register(alloc, 0xE000, try testRegisterEntry(alloc, 0xE000));
+    glossary.clearAndFree(alloc);
+    try testing.expectEqual(@as(u64, 5), glossary.revision);
+}
+
+test "Glossary repeated replacement remains one live entry" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var glossary: Glossary = .empty;
+    defer glossary.deinit(alloc);
+
+    for (0..2048) |_| {
+        try glossary.register(
+            alloc,
+            0xE000,
+            try testRegisterEntry(alloc, 0xE000),
+        );
+    }
+    try testing.expectEqual(@as(usize, 1), glossary.entries.count());
+    try testing.expectEqual(@as(u64, 2048), glossary.revision);
+    try testing.expect(glossary.get(0xE000) != null);
 }
 
 test "Glossary contains reports registered slots" {
