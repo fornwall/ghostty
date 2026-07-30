@@ -604,6 +604,12 @@ fn printSliceFast(self: *Terminal, cps: []const u32) !usize {
         // The Kitty graphics placeholder requires row bookkeeping.
         if (cp0 == kitty.graphics.unicode.placeholder) return 0;
     }
+    // Glyph Protocol registrations carry an authoritative width override.
+    // The generic Unicode-width batcher cannot mix that session-local state
+    // into its comptime-specialized run, so let print() handle registered
+    // codepoints through the existing narrow/wide cell paths.
+    if (cp0 <= std.math.maxInt(u21) and
+        self.glyph_glossary.contains(@intCast(cp0))) return 0;
 
     // The first codepoint requires care when grapheme clustering is
     // enabled: print() examines the previous *cell* which can hold
@@ -810,6 +816,8 @@ fn printSliceFill(
             if (comptime width == .narrow) {
                 if (cp >= 0x10 and cp <= 0xFF) continue;
             }
+            if (cp <= std.math.maxInt(u21) and
+                self.glyph_glossary.contains(@intCast(cp))) break :run idx;
             if (cp > 0xFF and allow_unicode and printSliceEligible(cp, width)) {
                 if (!grapheme_cluster) continue;
                 var state: uucode.grapheme.BreakState = .default;
@@ -1344,7 +1352,12 @@ pub fn print(self: *Terminal, c: u21) !void {
     // non-single-width characters properly. We have a fast-path for
     // byte-sized characters since they're so common. We can ignore
     // control characters because they're always filtered prior.
-    const width: usize = if (c <= 0xFF) 1 else @intCast(unicode.table.get(c).width);
+    const width: usize = if (self.glyph_glossary.get(c)) |entry|
+        @intFromEnum(entry.width)
+    else if (c <= 0xFF)
+        1
+    else
+        @intCast(unicode.table.get(c).width);
 
     // Note: it is possible to have a width of "3" and a width of "-1" from
     // uucode.x's wcwidth. We should look into those cases and handle them
@@ -15709,4 +15722,35 @@ test "Terminal: glyph APC stores session glossary entries" {
 
     t.fullReset();
     try testing.expect(!t.glyph_glossary.contains(0xE0A0));
+}
+
+test "Terminal: glyph registration width overrides Unicode layout" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 10, .rows = 2 });
+    defer t.deinit(alloc);
+
+    var parser = glyph.CommandParser.init(alloc, 1024 * 1024);
+    defer parser.deinit();
+    for ("r;cp=e0a0;width=2;AAEAZABkA4QDhAACAAABAQEB9P5wAyADhPzgAAA=") |byte| {
+        try parser.feed(byte);
+    }
+    var req = try parser.complete(alloc);
+    defer req.deinit(alloc);
+    _ = t.glyphProtocol(alloc, &req);
+
+    // Exercise printSlice as used by the terminal stream. The registered PUA
+    // terminates the narrow batch and then uses the regular wide-cell path.
+    try t.printSlice(&.{ 'a', 0xE0A0, 'b' });
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.x);
+
+    const head = t.screens.active.pages.getCell(.{
+        .screen = .{ .x = 1, .y = 0 },
+    }).?.cell;
+    try testing.expectEqual(@as(u21, 0xE0A0), head.content.codepoint.data);
+    try testing.expectEqual(Cell.Wide.wide, head.wide);
+
+    const tail = t.screens.active.pages.getCell(.{
+        .screen = .{ .x = 2, .y = 0 },
+    }).?.cell;
+    try testing.expectEqual(Cell.Wide.spacer_tail, tail.wide);
 }
