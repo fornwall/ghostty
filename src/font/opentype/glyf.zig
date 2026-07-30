@@ -285,6 +285,15 @@ pub const Glyf = struct {
         pub const DecodeError = SizeError || Allocator.Error || error{
             /// Coordinate delta accumulation overflowed.
             CoordinateOverflow,
+
+            /// A caller-provided contour or point limit was exceeded.
+            ComplexityLimitExceeded,
+        };
+
+        /// Optional work limits for decoding untrusted outlines.
+        pub const DecodeLimits = struct {
+            max_contours: ?usize = null,
+            max_points: ?usize = null,
         };
 
         /// Determines the size (in bytes) of this entry.
@@ -444,6 +453,16 @@ pub const Glyf = struct {
         /// NOTE: Currently produces errors when given composite glyphs
         ///       or any glyphs that have hinting instructions included.
         pub fn decode(self: Entry, alloc: Allocator) DecodeError!Glyf.Outline {
+            return self.decodeWithLimits(alloc, .{});
+        }
+
+        /// Decode a simple glyph while enforcing caller-selected complexity
+        /// limits before allocating the corresponding contour or point arrays.
+        pub fn decodeWithLimits(
+            self: Entry,
+            alloc: Allocator,
+            limits: DecodeLimits,
+        ) DecodeError!Glyf.Outline {
             // We only support simple glyphs.
             switch (self.entryType()) {
                 .simple => {},
@@ -455,6 +474,9 @@ pub const Glyf = struct {
             // A zero-contour glyph may be header-only. See size for the
             // reason for the hardcoded 2 here.
             const num_contours: usize = @intCast(self.header.numberOfContours);
+            if (limits.max_contours) |max| {
+                if (num_contours > max) return error.ComplexityLimitExceeded;
+            }
             if (num_contours == 0 and self.data.len < 2) return .{
                 .points = &.{},
                 .contours = &.{},
@@ -491,6 +513,9 @@ pub const Glyf = struct {
                 // The final point tells us our point count.
                 break :point_count @as(usize, end_points[end_points.len - 1]) + 1;
             };
+            if (limits.max_points) |max| {
+                if (point_count > max) return error.ComplexityLimitExceeded;
+            }
 
             // Instructions are not supported.
             const instructions_length = try compat_reader.readerInt(&reader, sfnt.uint16, .big);
