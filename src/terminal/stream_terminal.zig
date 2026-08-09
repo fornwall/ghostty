@@ -17,6 +17,7 @@ const osc_color = @import("osc/parsers/color.zig");
 const kitty_color = @import("kitty/color.zig");
 const size_report = @import("size_report.zig");
 const simd = @import("../simd/main.zig");
+const terminfo = @import("../terminfo/main.zig");
 const Terminal = @import("Terminal.zig");
 
 const log = std.log.scoped(.stream_terminal);
@@ -69,6 +70,17 @@ pub const Handler = struct {
 
     /// The DCS command handler maintains state for DCS queries.
     dcs_handler: dcs.Handler = .{},
+
+    /// The name of the terminfo entry this terminal runs as, reported in
+    /// response to an XTGETTCAP query for "TN".
+    ///
+    /// The memory must remain valid for the lifetime of the handler.
+    /// Empty names and names longer than `max_terminfo_name_bytes` are
+    /// silently ignored.
+    terminfo_name: ?[]const u8 = null,
+
+    /// Maximum byte length accepted for `terminfo_name`.
+    pub const max_terminfo_name_bytes = 128;
 
     pub const Effects = struct {
         /// Called when the terminal needs to write data back to the pty,
@@ -401,10 +413,48 @@ pub const Handler = struct {
                 self.writePty(response[0..encoded.len :0]);
             },
 
-            .tmux,
-            .xtgettcap,
-            => {},
+            .xtgettcap => |*gettcap| {
+                if (self.effects.write_pty == null) return;
+                const map = comptime terminfo.ghostty.xtgettcapMap();
+                while (gettcap.next()) |key| {
+                    if (std.mem.eql(u8, key, encoded_tn_key)) {
+                        self.writeTerminfoName();
+                        continue;
+                    }
+                    self.writePty(map.get(key) orelse continue);
+                }
+            },
+
+            .tmux => {},
         }
+    }
+
+    /// Hex-encoded "TN", the XTGETTCAP key naming the terminfo entry.
+    /// The static map also carries this key with Ghostty's own name, so
+    /// it is intercepted before the lookup: an embedder that never
+    /// configured a name must not be reported as Ghostty's entry.
+    const encoded_tn_key = &std.fmt.bytesToHex("TN", .upper);
+
+    /// Fixed upper bound for an encoded "TN" reply.
+    const max_tn_response_bytes =
+        "\x1bP1+r".len + encoded_tn_key.len + "=".len +
+        (max_terminfo_name_bytes * 2) + "\x1b\\".len +
+        1; // null terminator
+
+    /// Answer an XTGETTCAP "TN" query from the configured terminfo name.
+    /// Unset, empty, or over-long names leave the query unanswered.
+    fn writeTerminfoName(self: *Handler) void {
+        const name = self.terminfo_name orelse return;
+        if (name.len == 0 or name.len > max_terminfo_name_bytes) return;
+
+        // Values are hex-encoded uppercase, matching the static map. The
+        // buffer fits any name allowed above, so the print cannot fail.
+        var buf: [max_tn_response_bytes]u8 = undefined;
+        self.writePty(std.fmt.bufPrintZ(
+            &buf,
+            "\x1bP1+r" ++ encoded_tn_key ++ "={X}\x1b\\",
+            .{name},
+        ) catch unreachable);
     }
 
     fn bell(self: *Handler) void {
@@ -1477,6 +1527,161 @@ test "DECRQSS without write effect is ignored" {
     try testing.expect(!s.handler.semantic_failure);
 }
 
+test "XTGETTCAP responses" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var response: [128]u8 = undefined;
+        var response_len: usize = 0;
+        var calls: usize = 0;
+
+        fn reset() void {
+            response_len = 0;
+            calls = 0;
+        }
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            @memcpy(response[0..data.len], data);
+            response_len = data.len;
+            calls += 1;
+        }
+
+        fn expectResponse(expected: []const u8) !void {
+            try testing.expectEqual(@as(usize, 1), calls);
+            try testing.expectEqualStrings(
+                expected,
+                response[0..response_len],
+            );
+            reset();
+        }
+    };
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // The full capability table comes from the static terminfo map; this
+    // checks the wiring for a valued and a valueless (boolean) capability.
+    s.nextSlice("\x1BP+q" ++ std.fmt.bytesToHex("Co", .upper) ++ "\x1B\\");
+    try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("Co", .upper) ++ "=" ++
+        std.fmt.bytesToHex("256", .upper) ++ "\x1B\\");
+    s.nextSlice("\x1BP+q" ++ std.fmt.bytesToHex("am", .upper) ++ "\x1B\\");
+    try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("am", .upper) ++ "\x1B\\");
+
+    // One response per requested key; lowercase hex is normalized by the
+    // DCS parser. The capture holds the last ("Co") reply.
+    s.nextSlice("\x1BP+q" ++ std.fmt.bytesToHex("am", .lower) ++ ";" ++
+        std.fmt.bytesToHex("Co", .lower) ++ "\x1B\\");
+    try testing.expectEqual(@as(usize, 2), S.calls);
+    try testing.expectEqualStrings(
+        "\x1BP1+r" ++ std.fmt.bytesToHex("Co", .upper) ++ "=" ++
+            std.fmt.bytesToHex("256", .upper) ++ "\x1B\\",
+        S.response[0..S.response_len],
+    );
+    S.reset();
+
+    // Unknown and malformed keys are skipped without an error.
+    s.nextSlice("\x1BP+qWHO;5;GG\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.calls);
+    try testing.expect(!s.handler.semantic_failure);
+}
+
+test "XTGETTCAP without write effect is ignored" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    s.nextSlice("\x1BP+q" ++ std.fmt.bytesToHex("TN", .upper) ++ ";" ++
+        std.fmt.bytesToHex("am", .upper) ++ "\x1B\\");
+    try testing.expect(!s.handler.semantic_failure);
+}
+
+test "XTGETTCAP TN responses" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var response: [512]u8 = undefined;
+        var response_len: usize = 0;
+        var calls: usize = 0;
+
+        fn reset() void {
+            response_len = 0;
+            calls = 0;
+        }
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            @memcpy(response[0..data.len], data);
+            response_len = data.len;
+            calls += 1;
+        }
+
+        fn expectResponse(expected: []const u8) !void {
+            try testing.expectEqual(@as(usize, 1), calls);
+            try testing.expectEqualStrings(
+                expected,
+                response[0..response_len],
+            );
+            reset();
+        }
+    };
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    const tn_query = "\x1BP+q" ++ std.fmt.bytesToHex("TN", .upper) ++ "\x1B\\";
+
+    // While no name is configured the query goes unanswered.
+    s.nextSlice(tn_query);
+    try testing.expectEqual(@as(usize, 0), S.calls);
+
+    // A configured name is reported hex-encoded.
+    s.handler.terminfo_name = "xterm-256color";
+    s.nextSlice(tn_query);
+    try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("TN", .upper) ++ "=" ++
+        std.fmt.bytesToHex("xterm-256color", .upper) ++ "\x1B\\");
+
+    // A maximum-length name is still reported in full.
+    const max_name = "a" ** Handler.max_terminfo_name_bytes;
+    s.handler.terminfo_name = max_name;
+    s.nextSlice(tn_query);
+    try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("TN", .upper) ++ "=" ++
+        std.fmt.bytesToHex(max_name.*, .upper) ++ "\x1B\\");
+
+    // An empty name is silent; "Co" is still answered.
+    s.handler.terminfo_name = "";
+    s.nextSlice("\x1BP+q" ++ std.fmt.bytesToHex("TN", .upper) ++ ";" ++
+        std.fmt.bytesToHex("Co", .upper) ++ "\x1B\\");
+    try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("Co", .upper) ++ "=" ++
+        std.fmt.bytesToHex("256", .upper) ++ "\x1B\\");
+
+    // As are names beyond the maximum length.
+    s.handler.terminfo_name = "a" ** (Handler.max_terminfo_name_bytes + 1);
+    s.nextSlice(tn_query);
+    try testing.expectEqual(@as(usize, 0), S.calls);
+    try testing.expect(!s.handler.semantic_failure);
+}
+
 test "DCS command memory is released" {
     var t: Terminal = try .init(
         testing.io,
@@ -1487,8 +1692,8 @@ test "DCS command memory is released" {
 
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
 
-    // A completed, unsupported command transfers its allocation to Command;
-    // dcsCommand must release it even though stream_terminal ignores it.
+    // A completed command transfers its allocation to Command; dcsCommand
+    // must release it even when there is no write effect.
     s.nextSlice("\x1BP+q536D756C78\x1B\\");
 
     // An incomplete command remains owned by the handler and must be released
