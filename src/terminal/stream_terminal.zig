@@ -62,6 +62,9 @@ pub const Handler = struct {
     /// inject text into the input stream of the foreground process.
     title_report: bool = false,
 
+    /// Whether VT escape sequences may resize the terminal using DECCOLM.
+    allow_vt_resize: bool = true,
+
     /// The APC command handler maintains the APC state. APC is like
     /// CSI or OSC, but it is a private escape sequence that is used
     /// to send commands to the terminal emulator. This is used by
@@ -779,6 +782,8 @@ pub const Handler = struct {
     }
 
     fn setMode(self: *Handler, mode: modes.Mode, enabled: bool) !void {
+        if (mode == .@"132_column" and !self.allow_vt_resize) return;
+
         // Set the mode on the terminal
         self.terminal.modes.set(mode, enabled);
 
@@ -1448,6 +1453,53 @@ test "modes" {
     try testing.expect(!t.modes.get(.wraparound));
     s.nextSlice("\x1B[?7h"); // Enable wraparound
     try testing.expect(t.modes.get(.wraparound));
+}
+
+test "VT resize disabled" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    s.handler.allow_vt_resize = false;
+
+    s.nextSlice("\x1B[?40h");
+    try testing.expect(t.modes.get(.enable_mode_3));
+    s.nextSlice("\x1B[?3h");
+    try testing.expectEqual(@as(@TypeOf(t.cols), 80), t.cols);
+    try testing.expectEqual(@as(@TypeOf(t.rows), 24), t.rows);
+
+    // Resizes outside of VT processing are unaffected.
+    try s.handler.resize(.{ .cols = 132, .rows = 24 });
+    s.nextSlice("\x1B[?3l");
+    try testing.expectEqual(@as(@TypeOf(t.cols), 132), t.cols);
+
+    // XTRESTORE cannot resize either.
+    s.nextSlice("\x1B[?3s");
+    t.modes.set(.@"132_column", true);
+    s.nextSlice("\x1B[?3r");
+    try testing.expectEqual(@as(@TypeOf(t.cols), 132), t.cols);
+
+    // RIS does not change handler configuration.
+    s.nextSlice("\x1Bc");
+    try s.handler.resize(.{ .cols = 80, .rows = 24 });
+    s.nextSlice("\x1B[?40h");
+    s.nextSlice("\x1B[?3h");
+    try testing.expectEqual(@as(@TypeOf(t.cols), 80), t.cols);
+}
+
+test "VT resize enabled by default" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    s.nextSlice("\x1B[?40h");
+    try testing.expect(t.modes.get(.enable_mode_3));
+    s.nextSlice("\x1B[?3h");
+    try testing.expectEqual(@as(@TypeOf(t.cols), 132), t.cols);
 }
 
 test "scrolling regions" {

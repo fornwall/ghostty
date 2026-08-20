@@ -1230,6 +1230,17 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyString*
    */
   GHOSTTY_TERMINAL_OPT_TERMINFO_NAME = 37,
+
+  /**
+   * Allow VT escape sequences to resize the terminal.
+   *
+   * This controls DECCOLM (CSI ? 3 h/l). Disabling it does not affect resizes
+   * requested by the embedder through ghostty_terminal_resize(). This is
+   * enabled by default. A NULL value pointer disables it.
+   *
+   * Input type: bool*
+   */
+  GHOSTTY_TERMINAL_OPT_ALLOW_VT_RESIZE = 38,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 

@@ -1021,6 +1021,7 @@ pub const Option = enum(c_int) {
     unknown_sequence = 35,
     unknown_max_bytes = 36,
     terminfo_name = 37,
+    allow_vt_resize = 38,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1047,6 +1048,7 @@ pub const Option = enum(c_int) {
             .kitty_image_medium_shared_mem,
             .glyph_protocol,
             .title_report,
+            .allow_vt_resize,
             => ?*const bool,
             .kitty_image_medium_temp_file => ?*const lib.String,
             .apc_max_bytes,
@@ -1242,6 +1244,8 @@ fn setTyped(
         ),
         .unknown_max_bytes => wrapper.stream.handler.apc_handler.unknown_max_bytes =
             if (value) |ptr| ptr.* else 0,
+        .allow_vt_resize => wrapper.stream.handler.allow_vt_resize =
+            if (value) |ptr| ptr.* else false,
         .mode, .mode_default => {
             const config = (value orelse return .invalid_value).*;
             const mode = config.toMode() orelse return .invalid_value;
@@ -2416,6 +2420,33 @@ test "set and get mode" {
     try testing.expectEqual(Result.success, set(t, .mode, @ptrCast(&config)));
     try testing.expectEqual(Result.success, get(t, .mode, @ptrCast(&config)));
     try testing.expect(config.value);
+}
+
+test "allow_vt_resize" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const disabled = false;
+    try testing.expectEqual(Result.success, set(t, .allow_vt_resize, &disabled));
+    vt_write(t, "\x1b[?40h", 6);
+    try testing.expect(t.?.terminal.modes.get(.enable_mode_3));
+    vt_write(t, "\x1b[?3h", 5);
+    try testing.expectEqual(80, t.?.terminal.cols);
+
+    try testing.expectEqual(Result.success, resize(t, 132, 24, 0, 0));
+    vt_write(t, "\x1b[?3l", 5);
+    try testing.expectEqual(132, t.?.terminal.cols);
+
+    const enabled = true;
+    try testing.expectEqual(Result.success, set(t, .allow_vt_resize, &enabled));
+    vt_write(t, "\x1b[?3l", 5);
+    try testing.expectEqual(80, t.?.terminal.cols);
 }
 
 test "set mode default updates current and reset value" {
