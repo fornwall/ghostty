@@ -2912,6 +2912,10 @@ pub fn insertLines(self: *Terminal, count: usize) void {
                 cur_row,
                 cells[self.scrolling_region.left .. self.scrolling_region.right + 1],
             );
+
+            // A full-width clear creates a new blank logical row. Partial-width
+            // clears must preserve the metadata for the untouched cells.
+            if (!left_right) cur_row.resetMetadata();
         }
 
         // Mark the row as dirty
@@ -3072,6 +3076,10 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
                 cur_row,
                 cells[self.scrolling_region.left .. self.scrolling_region.right + 1],
             );
+
+            // A full-width clear creates a new blank logical row. Partial-width
+            // clears must preserve the metadata for the untouched cells.
+            if (!left_right) cur_row.resetMetadata();
         }
 
         // Mark the row as dirty
@@ -4136,6 +4144,36 @@ test "Terminal setScrollback only affects primary screen" {
     );
     try testing.expect(alternate.no_scrollback);
     try testing.expectEqual(alternate, t.screens.active);
+}
+
+test "Terminal: alternate screen scroll clears recycled row metadata" {
+    for ([_]size.CellCountInt{ 1, 3 }) |rows| {
+        var t = try init(testing.io, testing.allocator, .{
+            .cols = 5,
+            .rows = rows,
+        });
+        defer t.deinit(testing.allocator);
+
+        _ = try t.switchScreen(.alternate);
+        const screen = t.screens.active;
+
+        // Metadata on the row scrolled off the top must not be retained by the
+        // blank row that reuses its Row allocation at the bottom.
+        const top = screen.pages.getCell(.{ .active = .{} }).?;
+        top.row.wrap = true;
+        top.row.wrap_continuation = true;
+        top.row.semantic_prompt = .prompt;
+
+        screen.cursorAbsolute(0, t.rows - 1);
+        try t.index();
+
+        const bottom = screen.pages.getCell(.{ .active = .{
+            .y = t.rows - 1,
+        } }).?;
+        try testing.expect(!bottom.row.wrap);
+        try testing.expect(!bottom.row.wrap_continuation);
+        try testing.expectEqual(.none, bottom.row.semantic_prompt);
+    }
 }
 
 test "Terminal: resize resets synchronized output" {
@@ -8256,6 +8294,17 @@ test "Terminal: insertLines more than remaining" {
     // Move to row 2
     t.setCursorPos(2, 1);
 
+    // All rows that will be cleared have metadata that must not survive.
+    for (1..t.rows) |y| {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = @intCast(y),
+        } }).?;
+        list_cell.row.wrap = true;
+        list_cell.row.wrap_continuation = true;
+        list_cell.row.semantic_prompt = .prompt;
+    }
+
     // Insert a bunch of  lines
     t.clearDirty();
     t.insertLines(20);
@@ -8263,6 +8312,16 @@ test "Terminal: insertLines more than remaining" {
     try testing.expect(!t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 2 } }));
+
+    for (1..t.rows) |y| {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = @intCast(y),
+        } }).?;
+        try testing.expect(!list_cell.row.wrap);
+        try testing.expect(!list_cell.row.wrap_continuation);
+        try testing.expectEqual(.none, list_cell.row.semantic_prompt);
+    }
 
     {
         const str = try t.plainString(testing.allocator);
@@ -11238,6 +11297,17 @@ test "Terminal: deleteLines with scroll region, large count" {
     t.setTopAndBottomMargin(1, 3);
     t.setCursorPos(1, 1);
 
+    // All rows that will be cleared have metadata that must not survive.
+    for (0..3) |y| {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = @intCast(y),
+        } }).?;
+        list_cell.row.wrap = true;
+        list_cell.row.wrap_continuation = true;
+        list_cell.row.semantic_prompt = .prompt;
+    }
+
     t.clearDirty();
     t.deleteLines(5);
 
@@ -11245,6 +11315,16 @@ test "Terminal: deleteLines with scroll region, large count" {
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 2 } }));
     try testing.expect(!t.isDirty(.{ .active = .{ .x = 0, .y = 3 } }));
+
+    for (0..3) |y| {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = @intCast(y),
+        } }).?;
+        try testing.expect(!list_cell.row.wrap);
+        try testing.expect(!list_cell.row.wrap_continuation);
+        try testing.expectEqual(.none, list_cell.row.semantic_prompt);
+    }
 
     try t.print('E');
     t.carriageReturn();
