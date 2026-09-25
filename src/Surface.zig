@@ -4319,7 +4319,7 @@ fn maybePromptClick(self: *Surface) !bool {
             // This matches what Kitty sends.
             const key: u8, const y: u32 = switch (v) {
                 .absolute => .{ 1, pos_vp.y +| 1 },
-                .relative => .{ 2, pos_vp.y -| prompt_pin.y +| 1 },
+                .relative => .{ 2, promptClickRelativeRow(prompt_pin, click_pin) },
             };
             var data: termio.Message.WriteReq.Small.Array = undefined;
             const resp = try std.fmt.bufPrint(
@@ -4362,6 +4362,53 @@ fn maybePromptClick(self: *Surface) !bool {
     }
 
     return true;
+}
+
+/// Return the one-based click row relative to the prompt. The click must
+/// be at or after the prompt, as checked by maybePromptClick.
+fn promptClickRelativeRow(prompt_pin: terminal.Pin, click_pin: terminal.Pin) u32 {
+    // Pin rows are page-local, so walk the pages from the prompt to the click.
+    var rows: u32 = click_pin.y + 1;
+    var node = prompt_pin.node;
+    while (node != click_pin.node) : (node = node.next.?) rows += node.rows();
+    return rows - prompt_pin.y;
+}
+
+test "promptClickRelativeRow" {
+    const testing = std.testing;
+    var pages = try terminal.PageList.init(testing.allocator, .{
+        .cols = 80,
+        .rows = 5,
+    });
+    defer pages.deinit();
+
+    // Grow the screen across three pages so pins can differ in page.
+    const first = pages.pages.first.?;
+    while (first.next == null) _ = try pages.grow();
+    const second = first.next.?;
+    while (second.next == null) _ = try pages.grow();
+    for (0..4) |_| _ = try pages.grow();
+
+    const first_rows: u32 = first.rows();
+    const second_rows: u32 = second.rows();
+    const cases = [_]struct { prompt: u32, click: u32, expected: u32 }{
+        .{ .prompt = 10, .click = 10, .expected = 1 },
+        .{ .prompt = 10, .click = 12, .expected = 3 },
+        .{ .prompt = first_rows - 1, .click = first_rows + 1, .expected = 3 },
+        .{
+            .prompt = first_rows - 1,
+            .click = first_rows + second_rows + 1,
+            .expected = second_rows + 3,
+        },
+    };
+    for (cases) |case| {
+        const prompt_pin = pages.pin(.{ .screen = .{ .y = case.prompt } }).?;
+        const click_pin = pages.pin(.{ .screen = .{ .x = 4, .y = case.click } }).?;
+        try testing.expectEqual(
+            case.expected,
+            promptClickRelativeRow(prompt_pin, click_pin),
+        );
+    }
 }
 
 const Link = struct {
