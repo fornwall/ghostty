@@ -114,6 +114,7 @@
 //! is no previous character. Boolean fields are zero or one.
 //! Cursor blink and mouse shift-capture policies encode null as zero, false as
 //! one, and true as two.
+//! Mouse shape encodes an unset OSC 22 request as `0xff`.
 //! Canonical encoders use only the documented enum and boolean values.
 //! Decoders replace unknown semantic values with neutral native defaults,
 //! discard invalid previous codepoints, and reset each invalid scrolling axis
@@ -342,7 +343,7 @@ pub const Header = struct {
     mouse_event: terminal_mouse.Event,
     mouse_format: terminal_mouse.Format,
     mouse_shift_capture: ?bool,
-    mouse_shape: terminal_mouse.Shape,
+    mouse_shape: ?terminal_mouse.Shape,
     password_input: bool,
 
     // Runtime, saved, and reset mode sets.
@@ -468,7 +469,10 @@ pub const Header = struct {
         try writer.writeByte(@intCast(@intFromEnum(self.mouse_event)));
         try writer.writeByte(@intCast(@intFromEnum(self.mouse_format)));
         try writer.writeByte(encodeOptionalBool(self.mouse_shift_capture));
-        try writer.writeByte(@intCast(@intFromEnum(self.mouse_shape)));
+        try writer.writeByte(if (self.mouse_shape) |shape|
+            @intCast(@intFromEnum(shape))
+        else
+            0xFF);
         try writer.writeByte(@intFromBool(self.password_input));
 
         // Runtime, saved, and reset mode sets. ModePacked occupies 43 bits;
@@ -577,7 +581,7 @@ pub const Header = struct {
         const mouse_shape = enumFromInt(
             terminal_mouse.Shape,
             try reader.takeByte(),
-        ) orelse .text;
+        );
         const password_input = switch (try reader.takeByte()) {
             0 => false,
             1 => true,
@@ -1386,7 +1390,7 @@ test "TERMINAL header decoding normalizes semantic values" {
     try testing.expectEqual(terminal_mouse.Event.none, decoded.mouse_event);
     try testing.expectEqual(terminal_mouse.Format.x10, decoded.mouse_format);
     try testing.expectEqual(null, decoded.mouse_shift_capture);
-    try testing.expectEqual(terminal_mouse.Shape.text, decoded.mouse_shape);
+    try testing.expectEqual(null, decoded.mouse_shape);
     try testing.expect(!decoded.password_input);
     try testing.expect(decoded.current_modes.disable_keyboard);
     try testing.expectEqualDeep(DynamicRGB.unset, decoded.background);

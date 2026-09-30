@@ -461,7 +461,11 @@ fn mouseTable(t: *Terminal) void {
         }
         {
             _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-            cimgui.c.ImGui_Text("%s", @tagName(t.mouse_shape).ptr);
+            if (t.mouse_shape) |shape| {
+                cimgui.c.ImGui_Text("%s", @tagName(shape).ptr);
+            } else {
+                cimgui.c.ImGui_TextDisabled("(unset)");
+            }
         }
     }
 
