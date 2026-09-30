@@ -18,8 +18,8 @@ physical_key: input.Key,
 /// The mouse event tracking mode, if any.
 mouse_event: terminal.MouseEvent,
 
-/// The current terminal's mouse shape.
-mouse_shape: MouseShape,
+/// The application's OSC 22 request, if any.
+mouse_shape: ?MouseShape,
 
 /// The last mods state when the last mouse button (whatever it was) was
 /// pressed or release.
@@ -49,38 +49,22 @@ pub fn keyToMouseShape(self: SurfaceMouse) ?MouseShape {
         return null;
     }
 
-    // Handle possible overrides depending on mouse tracking state.
-    switch (self.mouse_event != .none) {
-        true => {
-            // In mouse tracking mode
-            if (isMouseModeOverrideState(self.mods) and isRectangleSelectState(self.mods)) {
-                // Crosshair (rectangle select), only set if we are also
-                // overriding (e.g. shift+ctrl+alt)
-                return .crosshair;
-            } else if (isMouseModeOverrideState(self.mods)) {
-                // Normal override state
-                return .text;
-            }
-        },
+    return self.shape();
+}
 
-        false => {
-            // Default terminal mode
-            if (isRectangleSelectState(self.mods)) {
-                // Crosshair (rectangle select)
-                return .crosshair;
-            } else if (isMouseModeOverrideState(self.mods)) {
-                // Shift shows an I-beam so selection is obvious even when
-                // the application cursor is not text (OSC 22). Release
-                // restores mouse_shape below.
-                return .text;
-            }
-        },
+/// Resolve the displayed shape from host overrides, the application request,
+/// and finally the mouse tracking default.
+pub fn shape(self: SurfaceMouse) MouseShape {
+    if (self.over_link) return .pointer;
+
+    if (isRectangleSelectState(self.mods) and
+        (self.mouse_event == .none or isMouseModeOverrideState(self.mods)))
+    {
+        return .crosshair;
     }
+    if (isMouseModeOverrideState(self.mods)) return .text;
 
-    // No overrides means we just revert back to the stored terminal mouse
-    // shape. Note that this may be different than what has been currently sent
-    // to the apprt, so this will force the reset.
-    return self.mouse_shape;
+    return self.mouse_shape orelse if (self.mouse_event == .none) .text else .default;
 }
 
 fn eligibleMouseShapeKeyEvent(physical_key: input.Key) bool {
@@ -294,4 +278,33 @@ test "keyToMouseShape" {
         const got = m.keyToMouseShape();
         try testing.expect(want == got);
     }
+}
+
+test "mouse shape request and host overrides" {
+    const testing = std.testing;
+    var m: SurfaceMouse = .{
+        .physical_key = .unidentified,
+        .mouse_event = .none,
+        .mouse_shape = null,
+        .mods = .{},
+        .over_link = false,
+        .hidden = false,
+    };
+
+    for ([_]terminal.MouseEvent{ .none, .normal }) |event| {
+        m.mouse_event = event;
+        m.mouse_shape = null;
+        const default: MouseShape = if (event == .none) .text else .default;
+        try testing.expectEqual(default, m.shape());
+
+        // Explicit text also overrides the tracking default.
+        for ([_]MouseShape{ .text, .wait }) |request| {
+            m.mouse_shape = request;
+            try testing.expectEqual(request, m.shape());
+        }
+    }
+
+    m.mods = .{ .shift = true, .ctrl = true, .super = true, .alt = true };
+    m.over_link = true;
+    try testing.expectEqual(MouseShape.pointer, m.shape());
 }
