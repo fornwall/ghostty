@@ -1317,8 +1317,7 @@ pub fn print(self: *Terminal, c: u21) !void {
                     self.screens.active.cursorLeft(prev.left);
 
                     // If we don't have space for the wide char, we need to
-                    // insert spacers and wrap. We need special handling if the
-                    // previous cell has grapheme data.
+                    // insert spacers and wrap.
                     if (self.screens.active.cursor.x == right_limit - 1) {
                         if (!self.modes.get(.wraparound)) return;
 
@@ -1330,62 +1329,27 @@ pub fn print(self: *Terminal, c: u21) !void {
                         if (row_wrap) self.screens.active.cursor.page_row.wrap = true;
 
                         const prev_cp = prev.cell.content.codepoint.data;
-                        if (prev.cell.hasGrapheme()) {
-                            // This is like printCell but without clearing the
-                            // grapheme data from the cell, so we can move it
-                            // later.
-                            prev.cell.wide = if (row_wrap) .spacer_head else .narrow;
-                            prev.cell.content.codepoint.data = 0;
+                        // Wrapping can erase or move the source cell, so copy
+                        // its grapheme data out first.
+                        var grapheme_buf: [pagepkg.grapheme_max_len]u21 = undefined;
+                        const cps: []const u21 = self.screens.active.cursor.page_pin.node.page().lookupGrapheme(prev.cell) orelse &.{};
+                        const graphemes = grapheme_buf[0..cps.len];
+                        @memcpy(graphemes, cps);
 
-                            try self.printWrap();
-                            self.printCell(prev_cp, .wide);
+                        self.printCell(0, if (row_wrap) .spacer_head else .narrow);
+                        try self.printWrap();
+                        self.printCell(prev_cp, .wide);
 
-                            const new_pin = self.screens.active.cursor.page_pin.*;
-                            const new_rac = new_pin.rowAndCell();
-
-                            transfer_graphemes: {
-                                var old_pin = self.screens.active.cursor.page_pin.up(1) orelse break :transfer_graphemes;
-                                old_pin.x = right_limit - 1;
-                                const old_rac = old_pin.rowAndCell();
-
-                                if (new_pin.node == old_pin.node) {
-                                    new_pin.node.page().moveGrapheme(old_rac.cell, new_rac.cell);
-                                    old_rac.cell.content_tag = .codepoint;
-                                    new_rac.cell.content_tag = .codepoint_grapheme;
-                                    new_rac.row.grapheme = true;
-                                } else {
-                                    const cps = old_pin.node.page().lookupGrapheme(old_rac.cell).?;
-                                    for (cps) |cp| {
-                                        // appendGrapheme can grow the cursor
-                                        // page, so read the destination from
-                                        // the cursor each time rather than
-                                        // holding a pointer across the call.
-                                        try self.screens.active.appendGrapheme(
-                                            self.screens.active.cursor.page_cell,
-                                            cp,
-                                        );
-                                    }
-                                    old_pin.node.page().clearGrapheme(old_rac.cell);
-                                }
-
-                                old_pin.node.page().updateRowGraphemeFlag(old_rac.row);
-                            }
-
-                            // Point prev.cell to our new previous cell that
-                            // we'll be appending graphemes to
-                            prev.cell = self.screens.active.cursor.page_cell;
-                        } else {
-                            self.printCell(
-                                0,
-                                if (row_wrap) .spacer_head else .narrow,
+                        // Appending can grow the page, so reload the
+                        // destination from the cursor each time.
+                        for (graphemes) |cp| {
+                            try self.screens.active.appendGrapheme(
+                                self.screens.active.cursor.page_cell,
+                                cp,
                             );
-                            try self.printWrap();
-                            self.printCell(prev_cp, .wide);
-
-                            // Point prev.cell to our new previous cell that
-                            // we'll be appending graphemes to
-                            prev.cell = self.screens.active.cursor.page_cell;
                         }
+
+                        prev.cell = self.screens.active.cursor.page_cell;
                     } else {
                         prev.cell.wide = .wide;
                     }
@@ -6313,6 +6277,68 @@ test "Terminal: grapheme transfer when widening wraps to the next line" {
             .y = 1,
         } }).?;
         try testing.expectEqual(Cell.Wide.spacer_tail, list_cell.cell.wide);
+    }
+}
+
+test "Terminal: grapheme transfer when widening wraps below the scroll region" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(testing.allocator);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[?2027h\x1b[1;2r\x1b[999;999H\u{2764}\u{200D}\u{1F44D}");
+
+    const base = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 4 } }).?;
+    try testing.expectEqual(@as(u21, 0x2764), base.cell.codepoint());
+    try testing.expectEqual(Cell.Wide.wide, base.cell.wide);
+    try testing.expectEqualSlices(
+        u21,
+        &.{ 0x200D, 0x1F44D },
+        base.node.page().lookupGrapheme(base.cell).?,
+    );
+}
+
+test "Terminal: grapheme transfer when widening scrolls a single row" {
+    for ([_]bool{ false, true }) |alternate| {
+        for ([_]bool{ false, true }) |margins| {
+            var t = try init(testing.io, testing.allocator, .{ .rows = 1, .cols = 5 });
+            defer t.deinit(testing.allocator);
+
+            t.modes.set(.grapheme_cluster, true);
+            if (alternate) _ = try t.switchScreen(.alternate);
+
+            // Leave an unrelated cluster above the cursor on the primary
+            // screen. Scrolling within margins must not take its marks.
+            t.setCursorPos(1, 5);
+            try t.print('a');
+            try t.print(0x0301);
+            try t.index();
+
+            if (margins) {
+                t.modes.set(.enable_left_and_right_margin, true);
+                t.setLeftAndRightMargin(3, 0);
+            }
+            t.setCursorPos(1, 5);
+            try t.print(0x2764);
+            try t.print(0x200D);
+            try t.print(0x1F44D);
+
+            const x: size.CellCountInt = if (margins) 2 else 0;
+            const base = t.screens.active.pages.getCell(.{ .active = .{ .x = x, .y = 0 } }).?;
+            try testing.expectEqual(@as(u21, 0x2764), base.cell.codepoint());
+            try testing.expectEqual(Cell.Wide.wide, base.cell.wide);
+            try testing.expectEqualSlices(
+                u21,
+                &.{ 0x200D, 0x1F44D },
+                base.node.page().lookupGrapheme(base.cell).?,
+            );
+
+            if (!alternate) {
+                const history = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
+                try testing.expectEqual(@as(u21, 'a'), history.cell.codepoint());
+                try testing.expectEqualSlices(u21, &.{0x0301}, history.node.page().lookupGrapheme(history.cell).?);
+            }
+        }
     }
 }
 
