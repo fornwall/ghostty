@@ -1826,7 +1826,7 @@ fn getTyped(
             t.modes.get(.mouse_event_normal) or
             t.modes.get(.mouse_event_button) or
             t.modes.get(.mouse_event_any),
-        .mouse_shape => out.* = t.mouse_shape,
+        .mouse_shape => out.* = t.mouse_shape orelse .text,
         .title => {
             const title = t.getTitle() orelse "";
             out.* = .{ .ptr = title.ptr, .len = title.len };

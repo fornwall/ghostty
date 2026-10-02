@@ -1057,14 +1057,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             );
         },
 
-        .set_mouse_shape => |shape| {
-            log.debug("changing mouse shape: {}", .{shape});
-            _ = try self.rt_app.performAction(
-                .{ .surface = self },
-                .mouse_shape,
-                shape,
-            );
-        },
+        .refresh_mouse_shape => |v| try self.refreshMouseShape(v.clear_hover),
 
         .clipboard_read => |clipboard| {
             if (self.config.clipboard_read == .deny) {
@@ -1602,6 +1595,45 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
     }
 }
 
+fn refreshMouseShape(self: *Surface, clear_hover: bool) !void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    // Mouse motion may already have cleared over_link before this message,
+    // so clear hover whenever tracking disallows link interaction.
+    if (clear_hover or (self.io.terminal.flags.mouse_event != .none and
+        (!self.mouse.mods.shift or self.mouseShiftCapture(false))))
+    {
+        self.mouse.over_link = false;
+        self.mouse.link_point = null;
+        self.renderer_state.mouse.point = null;
+        self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
+        _ = try self.rt_app.performAction(
+            .{ .surface = self },
+            .mouse_over_link,
+            .{ .url = "" },
+        );
+        try self.queueRender();
+    }
+
+    _ = try self.rt_app.performAction(
+        .{ .surface = self },
+        .mouse_shape,
+        self.mouseState(.unidentified).shape(),
+    );
+}
+
+fn mouseState(self: *const Surface, physical_key: input.Key) SurfaceMouse {
+    return .{
+        .physical_key = physical_key,
+        .mouse_event = self.io.terminal.flags.mouse_event,
+        .mouse_shape = self.io.terminal.mouse_shape,
+        .mods = self.mouse.mods,
+        .over_link = self.mouse.over_link,
+        .hidden = self.mouse.hidden,
+    };
+}
+
 /// Call this whenever the mouse moves or mods changed. The time
 /// at which this is called may matter for the correctness of other
 /// mouse events (see cursorPosCallback) but this is shared logic
@@ -1703,10 +1735,11 @@ fn mouseRefreshLinks(
     // No link, if we're previously over a link then we need to clear
     // the over-link apprt state.
     if (over_link) {
+        self.mouse.over_link = false;
         _ = try self.rt_app.performAction(
             .{ .surface = self },
             .mouse_shape,
-            self.io.terminal.mouse_shape,
+            self.mouseState(.unidentified).shape(),
         );
         _ = try self.rt_app.performAction(
             .{ .surface = self },
@@ -2844,10 +2877,11 @@ pub fn keyCallback(
             };
         } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
             // If we have mouse reports on and we don't have shift pressed, we reset state
+            self.mouse.over_link = false;
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
-                self.io.terminal.mouse_shape,
+                self.mouseState(.unidentified).shape(),
             );
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -2860,14 +2894,7 @@ pub fn keyCallback(
 
     // Process the cursor state logic. This will update the cursor shape if
     // needed, depending on the key state.
-    if ((SurfaceMouse{
-        .physical_key = event.key,
-        .mouse_event = self.io.terminal.flags.mouse_event,
-        .mouse_shape = self.io.terminal.mouse_shape,
-        .mods = self.mouse.mods,
-        .over_link = self.mouse.over_link,
-        .hidden = self.mouse.hidden,
-    }).keyToMouseShape()) |shape| _ = try self.rt_app.performAction(
+    if (self.mouseState(event.key).keyToMouseShape()) |shape| _ = try self.rt_app.performAction(
         .{ .surface = self },
         .mouse_shape,
         shape,
@@ -4653,7 +4680,7 @@ pub fn cursorPosCallback(
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
-                self.io.terminal.mouse_shape,
+                self.mouseState(.unidentified).shape(),
             );
             _ = try self.rt_app.performAction(
                 .{ .surface = self },

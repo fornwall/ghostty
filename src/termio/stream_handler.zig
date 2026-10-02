@@ -738,42 +738,10 @@ pub const StreamHandler = struct {
                 .focused = self.terminal.flags.focused,
             }),
 
-            .mouse_event_x10 => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .x10;
-                    try self.setMouseShape(.default);
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                    try self.setMouseShape(.text);
-                }
-            },
-            .mouse_event_normal => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .normal;
-                    try self.setMouseShape(.default);
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                    try self.setMouseShape(.text);
-                }
-            },
-            .mouse_event_button => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .button;
-                    try self.setMouseShape(.default);
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                    try self.setMouseShape(.text);
-                }
-            },
-            .mouse_event_any => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .any;
-                    try self.setMouseShape(.default);
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                    try self.setMouseShape(.text);
-                }
-            },
+            .mouse_event_x10 => self.setMouseEvent(if (enabled) .x10 else .none),
+            .mouse_event_normal => self.setMouseEvent(if (enabled) .normal else .none),
+            .mouse_event_button => self.setMouseEvent(if (enabled) .button else .none),
+            .mouse_event_any => self.setMouseEvent(if (enabled) .any else .none),
 
             .mouse_format_utf8 => self.terminal.flags.mouse_format = if (enabled) .utf8 else .x10,
             .mouse_format_sgr => self.terminal.flags.mouse_format = if (enabled) .sgr else .x10,
@@ -887,7 +855,7 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
     ) !void {
         self.terminal.fullReset();
-        try self.setMouseShape(.text);
+        self.surfaceMessageWriter(.{ .refresh_mouse_shape = .{ .clear_hover = true } });
 
         // Full reset clears Kitty clipboard session grants.
         self.kitty_clipboard_grants.deinit(self.alloc);
@@ -991,7 +959,17 @@ pub const StreamHandler = struct {
         if (self.terminal.mouse_shape == shape) return;
 
         self.terminal.mouse_shape = shape;
-        self.surfaceMessageWriter(.{ .set_mouse_shape = shape });
+        self.surfaceMessageWriter(.{ .refresh_mouse_shape = .{} });
+    }
+
+    inline fn setMouseEvent(
+        self: *StreamHandler,
+        event: terminal.MouseEvent,
+    ) void {
+        const was_tracking = self.terminal.flags.mouse_event != .none;
+        self.terminal.flags.mouse_event = event;
+        if (was_tracking == (event != .none)) return;
+        self.surfaceMessageWriter(.{ .refresh_mouse_shape = .{} });
     }
 
     fn clipboardContents(self: *StreamHandler, kind: u8, data: []const u8) !void {
