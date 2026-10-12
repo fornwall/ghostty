@@ -1275,8 +1275,9 @@ pub fn print(self: *Terminal, c: u21) !void {
         break :charset state.charsets.get(key);
     };
 
-    // Our right margin depends where our cursor is now.
-    const right_limit = if (self.screens.active.cursor.x > self.scrolling_region.right)
+    // Our right margin depends where our cursor is now. A wrap moves the
+    // cursor to the left margin, so the right limit is updated after each one.
+    var right_limit = if (self.screens.active.cursor.x > self.scrolling_region.right)
         self.cols
     else
         self.scrolling_region.right + 1;
@@ -1387,6 +1388,7 @@ pub fn print(self: *Terminal, c: u21) !void {
 
                         self.writeCell(0, if (row_wrap) .spacer_head else .narrow);
                         try self.printWrap();
+                        right_limit = self.scrolling_region.right + 1;
                         self.writeCell(prev_cp, .wide);
                         if (prev_grapheme.len > 0) {
                             try self.screens.active.setGraphemes(
@@ -1538,6 +1540,7 @@ pub fn print(self: *Terminal, c: u21) !void {
     if (self.screens.active.cursor.pending_wrap) {
         if (self.modes.get(.wraparound)) {
             try self.printWrap();
+            right_limit = self.scrolling_region.right + 1;
         } else {
             // Match xterm's consumption of a pending wrap.
             self.screens.active.cursor.pending_wrap = false;
@@ -1588,6 +1591,7 @@ pub fn print(self: *Terminal, c: u21) !void {
                     self.writeCell(0, .narrow);
                 }
                 try self.printWrap();
+                right_limit = self.scrolling_region.right + 1;
             }
 
             self.screens.active.cursorMarkDirty();
@@ -7530,6 +7534,76 @@ test "Terminal: print wide char at right margin does not create spacer head" {
         const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 3, .y = 1 } }).?;
         const cell = list_cell.cell;
         try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
+    }
+}
+
+test "Terminal: print wide char wrapping from outside right margin" {
+    // Columns 3-4 form the margin. The wide char wraps from the last column,
+    // fills the margin and leaves a wrap pending on it, so 'X' goes to the
+    // next row and not outside the margin. The '1' covers the case where the
+    // wrap was already pending in the last column.
+    for ([_][]const u32{
+        &.{ 0x1F600, 'X' },
+        &.{ '1', 0x1F600, 'X' },
+    }) |cps| {
+        for ([_]bool{ false, true }) |slice| {
+            var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5 });
+            defer t.deinit(testing.allocator);
+
+            t.modes.set(.enable_left_and_right_margin, true);
+            t.setLeftAndRightMargin(3, 4);
+            t.setCursorPos(1, 10);
+            if (slice) {
+                try t.printSlice(cps);
+            } else {
+                for (cps) |cp| try t.print(@intCast(cp));
+            }
+
+            try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.y);
+            try testing.expectEqual(@as(usize, 3), t.screens.active.cursor.x);
+            {
+                const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 2, .y = 1 } }).?;
+                try testing.expectEqual(@as(u21, 0x1F600), list_cell.cell.content.codepoint.data);
+                try testing.expectEqual(Cell.Wide.wide, list_cell.cell.wide);
+            }
+            {
+                const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 1 } }).?;
+                try testing.expectEqual(@as(u21, 0), list_cell.cell.content.codepoint.data);
+            }
+            {
+                const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 2, .y = 2 } }).?;
+                try testing.expectEqual(@as(u21, 'X'), list_cell.cell.content.codepoint.data);
+            }
+        }
+    }
+}
+
+test "Terminal: print grapheme widened from outside right margin" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.grapheme_cluster, true);
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(3, 4);
+    t.setCursorPos(1, 10);
+    try t.print(0x2764); // Heavy black heart
+    try t.print(0xFE0F); // Emoji presentation, wraps to the left margin
+    try t.print('X');
+
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 3), t.screens.active.cursor.x);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 2, .y = 1 } }).?;
+        try testing.expectEqual(@as(u21, 0x2764), list_cell.cell.content.codepoint.data);
+        try testing.expectEqual(Cell.Wide.wide, list_cell.cell.wide);
+    }
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 1 } }).?;
+        try testing.expectEqual(@as(u21, 0), list_cell.cell.content.codepoint.data);
+    }
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 2, .y = 2 } }).?;
+        try testing.expectEqual(@as(u21, 'X'), list_cell.cell.content.codepoint.data);
     }
 }
 
