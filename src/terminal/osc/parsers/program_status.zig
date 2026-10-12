@@ -356,7 +356,8 @@ fn validate(data: []const u8) error{
 
     // Every value is checked against its limit, even one a later pair
     // replaces, because any limit violation discards the whole report.
-    var ids: kitty_metadata.ValueIterator("id", value_bytes) = .init(data);
+    // No alphabet filter on ids: one like `a@b` must fail here, not be skipped.
+    var ids: kitty_metadata.ValueIterator("id", null) = .init(data);
     while (ids.next()) |v| try validateId(v);
     inline for (.{
         .{ "app", max_app_bytes },
@@ -665,6 +666,9 @@ test "OSC 7501: ids" {
         "a//b",
         "a,b",
         "a=b",
+        "a@b",
+        "a b",
+        "a\xc3\xa9",
         max_segment ++ "a",
         "a/b/c/d/e/f/g/h/i",
         ("a" ** 31 ++ "/") ** 4 ++ "a",
