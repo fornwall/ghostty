@@ -103,6 +103,8 @@ pub fn encode(
 
     const cell = posToCell(event.pos, opts.size);
 
+    const button_code = buttonCode(event, opts) orelse return;
+
     // We only send motion events when the cell changed unless
     // we're tracking raw pixels.
     if (event.action == .motion and opts.format != .sgr_pixels) {
@@ -116,7 +118,6 @@ pub fn encode(
     // Update the last reported cell if we are tracking it.
     if (opts.last_cell) |last| last.* = cell;
 
-    const button_code = buttonCode(event, opts) orelse return;
     switch (opts.format) {
         .x10 => {
             if (cell.x > 222 or cell.y > 222) {
@@ -642,6 +643,7 @@ test "unsupported button is ignored" {
     });
 
     try testing.expectEqual(@as(usize, 0), writer.buffered().len);
+    try testing.expectEqual(@as(?point.Coordinate, null), last);
 }
 
 test "sgr pixels uses terminal-space cursor coordinates" {
