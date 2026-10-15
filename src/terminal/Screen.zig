@@ -8536,6 +8536,32 @@ test "Screen: resize less rows with full scrollback" {
     }
 }
 
+test "Screen: resize less rows trims blank rows under a stale viewport pin" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 2, .rows = 1, .max_scrollback_bytes = 10 * 1024 });
+    defer s.deinit();
+    try s.testWriteString("\n\n");
+
+    // Scrolling back to active leaves the viewport pin on a blank history
+    // row. Growing pulls that row into the active area.
+    s.scroll(.{ .delta_row = -1 });
+    s.scroll(.active);
+    try s.resize(.{ .cols = 2, .rows = 3 });
+    s.cursorAbsolute(0, 0);
+    try s.testWriteString("x");
+
+    try s.resize(.{ .cols = 2, .rows = 1 });
+    try testing.expectEqual(@as(usize, 1), s.pages.total_rows);
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("x", contents);
+    }
+}
+
 test "Screen: resize less cols no reflow" {
     const testing = std.testing;
     const alloc = testing.allocator;

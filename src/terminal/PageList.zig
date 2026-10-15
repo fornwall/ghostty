@@ -1280,6 +1280,20 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     // its too easy to get the logic wrong in here.
     self.viewport_pin_row_offset = null;
 
+    // An unused viewport pin must not prevent trimming blank rows or extend
+    // reflowed rows, so temporarily remove it from the tracked set. Removing
+    // it keeps the capacity to put it back without allocating.
+    const park_viewport_pin = self.viewport != .pin;
+    if (park_viewport_pin) {
+        const removed = self.tracked_pins.swapRemove(self.viewport_pin);
+        assert(removed);
+    }
+    // Restore the tracking entry so scrolling never needs to allocate.
+    defer if (park_viewport_pin) {
+        self.viewport_pin.* = .{ .node = self.pages.first.? };
+        self.tracked_pins.putAssumeCapacityNoClobber(self.viewport_pin, {});
+    };
+
     if (!opts.reflow) {
         try self.resizeWithoutReflow(opts);
         // Shrinking the active row count turns former active rows into
