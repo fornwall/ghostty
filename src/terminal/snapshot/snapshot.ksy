@@ -362,7 +362,7 @@ types:
         type: u1
         enum: mouse_shape
         valid:
-          expr: _.to_i <= 33
+          expr: _.to_i <= 33 or _.to_i == 255
       - id: password_input
         type: u1
         valid:

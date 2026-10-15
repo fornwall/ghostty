@@ -90,8 +90,8 @@ cursor: Cursor = .{},
 /// variant is in `flags.xt_checksum`.
 default_xt_checksum: xt_checksum.Flags = .{},
 
-/// The most recently set mouse shape for the terminal.
-mouse_shape: mouse.Shape = .text,
+/// Latest OSC 22 request; null uses the mouse-tracking default.
+mouse_shape: ?mouse.Shape = null,
 
 /// Per-session Glyph Protocol registrations.
 glyph_glossary: glyph.Glossary = .empty,
@@ -5029,6 +5029,7 @@ pub fn fullReset(self: *Terminal) void {
     self.modes.reset();
     self.tabstops.reset(TABSTOP_INTERVAL);
     self.previous_char = null;
+    self.mouse_shape = null;
     self.pwd.clearRetainingCapacity();
     self.title.clearRetainingCapacity();
     self.glyph_glossary.clearAndFree(self.gpa());
@@ -16113,6 +16114,15 @@ test "Terminal: fullReset with a non-empty pen" {
 
     try testing.expectEqual(@as(style.Id, 0), t.screens.active.cursor.style_id);
     try testing.expectEqual(.output, t.screens.active.cursor.semantic_content);
+}
+
+test "Terminal: fullReset mouse shape" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 80 });
+    defer t.deinit(testing.allocator);
+
+    t.mouse_shape = .pointer;
+    t.fullReset();
+    try testing.expectEqual(null, t.mouse_shape);
 }
 
 test "Terminal: fullReset hyperlink" {

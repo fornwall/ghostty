@@ -70,8 +70,10 @@ pub const Message = union(enum) {
     /// running program (CSI 8 t).
     resize_window: terminal.StreamAction.ResizeWindow,
 
-    /// Set the mouse shape.
-    set_mouse_shape: terminal.MouseShape,
+    /// Recompute the mouse shape using current terminal and host state.
+    refresh_mouse_shape: struct {
+        clear_hover: bool = false,
+    },
 
     /// Read the clipboard and write to the pty.
     clipboard_read: apprt.Clipboard,

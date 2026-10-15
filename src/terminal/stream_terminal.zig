@@ -742,7 +742,7 @@ pub const Handler = struct {
             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
             .semantic_prompt => try self.semanticPrompt(value),
             .mouse_shape => self.terminal.mouse_shape = value,
-            .mouse_shape_reset => self.terminal.mouse_shape = .text,
+            .mouse_shape_reset => self.terminal.mouse_shape = null,
             .color_operation => self.colorOperation(
                 &value.requests,
                 value.terminator,
@@ -2753,6 +2753,21 @@ test "resize effects do not change canonical terminal state" {
         authoritative.scrolling_region,
         readonly.scrolling_region,
     ));
+}
+
+test "mouse shape requests survive tracking changes until reset" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    s.nextSlice("\x1b[?1000h");
+    try testing.expectEqual(null, t.mouse_shape);
+    s.nextSlice("\x1b]22;text\x07\x1b[?1000l\x1b[?1000h");
+    try testing.expectEqual(.text, t.mouse_shape);
+    s.nextSlice("\x1b]22;\x07");
+    try testing.expectEqual(null, t.mouse_shape);
 }
 
 test "basic print" {
