@@ -573,6 +573,50 @@ pub const ImageStorage = struct {
         in_place,
     };
 
+    /// Pixel geometry needed to size placements independently of a Terminal,
+    /// including while Screen.resize is updating the grid dimensions.
+    pub const CellSize = struct {
+        width: u32 = 0,
+        height: u32 = 0,
+
+        pub fn init(t: *const terminal.Terminal) CellSize {
+            return .{ .width = t.width_px / t.cols, .height = t.height_px / t.rows };
+        }
+    };
+
+    /// Keep image origins across full-screen scrolls, including when their
+    /// anchor rows are discarded. The surviving rectangle, rather than just
+    /// its top-left cell, determines when a placement leaves retained history.
+    pub fn scrollFullScreenBegin(
+        self: *ImageStorage,
+        io: std.Io,
+        t: *terminal.Terminal,
+        delta: isize,
+    ) Scroll {
+        const s = t.screens.active;
+        var result: Scroll = .{ .screen = s, .io = io };
+        const history: i64 = @intCast(s.pages.total_rows - s.pages.rows);
+        var it = self.placements.iterator();
+        while (it.next()) |entry| {
+            const p = entry.value_ptr;
+            const pin = switch (p.location) {
+                .pin => |pin| pin,
+                .virtual, .relative => continue,
+            };
+            if (pin.garbage) continue;
+            const pt = s.pages.pointFromPin(.screen, pin.*) orelse continue;
+            result.restores.append(s.alloc, .{
+                .pin = pin,
+                .x = pin.x,
+                .y = @as(i64, pt.coord().y) - history + p.row_offset + delta,
+                .placement = .{ .key = entry.key_ptr.*, .rows = p.gridSize(self.images.get(entry.key_ptr.image_id).?, t).rows },
+            }) catch {
+                log.warn("OOM adjusting image placement for scroll", .{});
+            };
+        }
+        return result;
+    }
+
     /// Adjust placements for a scroll of the terminal's scrolling region
     /// by `delta` rows (negative moves content up). This implements the
     /// Kitty graphics protocol behavior for scrolls bounded by margins:
@@ -590,20 +634,18 @@ pub const ImageStorage = struct {
     /// once the rows have settled, making the result independent of the
     /// path taken. Every call must be paired with exactly one end().
     ///
-    /// Callers must skip this entirely when the scrolling region is the
-    /// full screen: a full-screen scroll moves placements with their
-    /// anchored rows (possibly into the scrollback) via pin tracking,
-    /// which already matches kitty's marginless scroll behavior.
+    /// Use scrollFullScreenBegin for marginless upward scrolls, which can
+    /// discard anchor rows while part of the image remains in history.
     pub fn scrollMarginsBegin(
         self: *ImageStorage,
         io: std.Io,
         t: *terminal.Terminal,
         delta: isize,
         op: ScrollOp,
-    ) ScrollMargins {
+    ) Scroll {
         const s: *terminal.Screen = t.screens.active;
         assert(self == &s.kitty_images);
-        var result: ScrollMargins = .{ .screen = s };
+        var result: Scroll = .{ .screen = s, .io = io };
 
         const top: i64 = t.scrolling_region.top;
         const bottom: i64 = t.scrolling_region.bottom;
@@ -630,17 +672,18 @@ pub const ImageStorage = struct {
                 .active,
                 pin.*,
             ) orelse continue).coord();
-            const y: i64 = coord.y;
+            const y: i64 = @as(i64, coord.y) + p.row_offset;
 
             // An in-place operation doesn't touch pins anchored outside
             // the region rows, and a placement anchored there can never
             // be entirely inside the region, so it needs no work at all.
-            if (op == .in_place and (y < top or y > bottom)) continue;
+            if (op == .in_place and p.row_offset == 0 and
+                (coord.y < top or coord.y > bottom)) continue;
 
             // The final position defaults to unmoved; restoring the pin
             // to this exact spot afterwards is what stops the row
             // operations from dragging the placement around.
-            var final_y: i64 = y;
+            var final_y: i64 = coord.y;
 
             inside: {
                 const image = self.images.get(entry.key_ptr.image_id) orelse break :inside;
@@ -701,6 +744,10 @@ pub const ImageStorage = struct {
                     self.removePlacement(s, entry);
                     mutated = true;
                     continue;
+                }
+                if (p.row_offset != 0) {
+                    p.row_offset = 0;
+                    mutated = true;
                 }
             }
 
@@ -798,6 +845,42 @@ pub const ImageStorage = struct {
 
         _ = self.removeOrphans(s, null);
         self.markMutated(io);
+    }
+
+    /// Preserve the visible suffix of images when resize discards history.
+    /// Reanchor them before eraseHistory moves pins in the discarded rows.
+    pub fn discardHistory(
+        self: *ImageStorage,
+        io: std.Io,
+        s: *terminal.Screen,
+        cell: CellSize,
+    ) void {
+        const history = s.pages.total_rows - s.pages.rows;
+        if (history == 0) return;
+        var mutated = false;
+        var it = self.placements.iterator();
+        while (it.next()) |entry| {
+            const p = entry.value_ptr;
+            const pin = switch (p.location) {
+                .pin => |pin| pin,
+                .virtual, .relative => continue,
+            };
+            const pt = s.pages.pointFromPin(.screen, pin.*) orelse continue;
+            if (pt.coord().y >= history) continue;
+            const y = @as(i64, pt.coord().y) + p.row_offset - @as(i64, @intCast(history));
+            const rows = p.gridSizeWithCellSize(self.images.get(entry.key_ptr.image_id).?, cell).rows;
+            if (rows > 0 and y + rows <= 0) {
+                self.removePlacement(s, entry);
+            } else {
+                p.row_offset = @intCast(@max(std.math.minInt(i32), y));
+                pin.* = s.pages.pin(.{ .active = .{ .x = pin.x } }).?;
+            }
+            mutated = true;
+        }
+        if (mutated) {
+            _ = self.removeOrphans(s, null);
+            self.markMutated(io);
+        }
     }
 
     fn clearPlacements(self: *ImageStorage, s: *terminal.Screen) void {
@@ -1905,30 +1988,55 @@ pub const ImageStorage = struct {
         return true;
     }
 
-    /// State returned by scrollMarginsBegin: the final active-area
-    /// position every surviving placement pin must be restored to once
-    /// the scrolled rows have settled. Every begin must be paired with
-    /// exactly one end() call after the scroll's row operations
-    /// complete.
-    pub const ScrollMargins = struct {
+    /// Final placement positions for a full-screen or margin scroll.
+    /// Every begin must be paired with end() after the row operations.
+    pub const Scroll = struct {
         screen: *terminal.Screen,
+        io: std.Io,
         restores: std.ArrayListUnmanaged(Restore) = .empty,
 
         const Restore = struct {
             pin: *PageList.Pin,
             x: size.CellCountInt,
-            y: u32,
+            y: i64,
+            placement: ?struct { key: PlacementKey, rows: u32 } = null,
         };
 
         /// Reposition every recorded placement pin to its post-scroll
         /// position and release the state. Must be called exactly
         /// once, after the scroll's row operations complete.
-        pub fn end(self: *ScrollMargins) void {
+        pub fn end(self: *Scroll) void {
+            const s = self.screen;
+            const storage = &s.kitty_images;
+            var mutated = false;
             for (self.restores.items) |restore| {
+                if (restore.placement) |placement| {
+                    const entry = storage.placements.getEntry(placement.key) orelse continue;
+                    const p = entry.value_ptr;
+                    const history = if (s.no_scrollback) 0 else s.pages.total_rows - s.pages.rows;
+                    const y = restore.y + @as(i64, @intCast(history));
+                    if (placement.rows > 0 and y + placement.rows <= 0) {
+                        storage.removePlacement(s, entry);
+                        mutated = true;
+                        continue;
+                    }
+                    const offset: i32 = @intCast(@max(std.math.minInt(i32), @min(0, y)));
+                    mutated = mutated or p.row_offset != offset;
+                    p.row_offset = offset;
+                    restore.pin.* = s.pages.pin(.{ .screen = .{
+                        .x = restore.x,
+                        .y = @intCast(@max(0, y)),
+                    } }) orelse continue;
+                    continue;
+                }
                 restore.pin.* = self.screen.pages.pin(.{ .active = .{
                     .x = restore.x,
-                    .y = restore.y,
+                    .y = @intCast(restore.y),
                 } }) orelse continue;
+            }
+            if (mutated) {
+                _ = storage.removeOrphans(s, null);
+                storage.markMutated(self.io);
             }
             self.restores.deinit(self.screen.alloc);
         }
@@ -1966,6 +2074,11 @@ pub const ImageStorage = struct {
     pub const Placement = struct {
         /// The location where this placement should be drawn.
         location: Location,
+
+        /// Rows between a pin and the image origin when the origin has
+        /// scrolled above retained history. Non-positive; discarding rows
+        /// moves the pin to the first retained row and adjusts this offset.
+        row_offset: i32 = 0,
 
         /// Offset of the x/y from the top-left of the cell.
         x_offset: u32 = 0,
@@ -2077,8 +2190,13 @@ pub const ImageStorage = struct {
             x: u32,
             y: u32,
         } {
-            const cell_width: u32 = t.width_px / t.cols;
-            const cell_height: u32 = t.height_px / t.rows;
+            const offset = self.cellOffsetWithCellSize(CellSize.init(t));
+            return .{ .x = offset.x, .y = offset.y };
+        }
+
+        fn cellOffsetWithCellSize(self: Placement, cell: CellSize) struct { x: u32, y: u32 } {
+            const cell_width = cell.width;
+            const cell_height = cell.height;
 
             return .{
                 .x = if (cell_width > 0)
@@ -2103,6 +2221,11 @@ pub const ImageStorage = struct {
             width: u32,
             height: u32,
         } {
+            const pixels = self.pixelSizeWithCellSize(image, CellSize.init(t));
+            return .{ .width = pixels.width, .height = pixels.height };
+        }
+
+        fn pixelSizeWithCellSize(self: Placement, image: Image, cell: CellSize) struct { width: u32, height: u32 } {
             const source = self.sourceRect(image);
             const width = source.width;
             const height = source.height;
@@ -2120,9 +2243,9 @@ pub const ImageStorage = struct {
             //
             // We assume that the width is divided evenly by the column
             // count and the height by the row count, because it should be.
-            const cell_width: u32 = t.width_px / t.cols;
-            const cell_height: u32 = t.height_px / t.rows;
-            const cell_offset = self.cellOffset(t);
+            const cell_width = cell.width;
+            const cell_height = cell.height;
+            const cell_offset = self.cellOffsetWithCellSize(cell);
 
             // If we have a specified cols AND rows then we calculate
             // the width and height from them directly, we don't need
@@ -2180,6 +2303,11 @@ pub const ImageStorage = struct {
             cols: u32,
             rows: u32,
         } {
+            const grid = self.gridSizeWithCellSize(image, CellSize.init(t));
+            return .{ .cols = grid.cols, .rows = grid.rows };
+        }
+
+        fn gridSizeWithCellSize(self: Placement, image: Image, cell: CellSize) struct { cols: u32, rows: u32 } {
             // If we have a specified columns and rows then this is trivial.
             if (self.columns > 0 and self.rows > 0) return .{
                 .cols = self.columns,
@@ -2188,18 +2316,18 @@ pub const ImageStorage = struct {
 
             // Otherwise we calculate the pixel size, divide by
             // cell size, and round up to the nearest integer.
-            const calc_size = self.pixelSize(image, t);
-            const cell_offset = self.cellOffset(t);
+            const calc_size = self.pixelSizeWithCellSize(image, cell);
+            const cell_offset = self.cellOffsetWithCellSize(cell);
             return .{
                 .cols = std.math.divCeil(
                     u32,
                     calc_size.width +| cell_offset.x,
-                    t.width_px / t.cols,
+                    cell.width,
                 ) catch 0,
                 .rows = std.math.divCeil(
                     u32,
                     calc_size.height +| cell_offset.y,
-                    t.height_px / t.rows,
+                    cell.height,
                 ) catch 0,
             };
             // NOTE: Above `divCeil`s can only fail if the cell size is 0,
@@ -2298,7 +2426,16 @@ pub const ImageStorage = struct {
             // pixel geometry is unavailable. It occupies no rectangle.
             if (grid_size.cols == 0 or grid_size.rows == 0) return null;
 
-            var br = switch (pin.downOverflow(grid_size.rows - 1)) {
+            var rows: usize = grid_size.rows;
+            const tl = switch (pin.upOverflow(@abs(self.row_offset))) {
+                .offset => |v| v,
+                .overflow => |v| clipped: {
+                    rows -|= v.remaining;
+                    break :clipped v.end;
+                },
+            };
+            if (rows == 0) return null;
+            var br = switch (tl.downOverflow(rows - 1)) {
                 .offset => |v| v,
                 .overflow => |v| v.end,
             };
@@ -2311,7 +2448,7 @@ pub const ImageStorage = struct {
             ));
 
             return .{
-                .top_left = pin.*,
+                .top_left = tl,
                 .bottom_right = br,
             };
         }
@@ -3355,6 +3492,205 @@ test "storage: partial history erase keeps later history placements" {
             s.placements.get(key).?.location.pin.*,
         ).?,
     );
+}
+
+test "storage: no scrollback index removes discarded placements" {
+    try testNoScrollbackPlacements(.index);
+}
+
+test "storage: no scrollback scroll up removes discarded placements" {
+    try testNoScrollbackPlacements(.scroll_up);
+}
+
+test "storage: no scrollback resize removes discarded placements" {
+    try testNoScrollbackPlacements(.resize);
+}
+
+fn testNoScrollbackPlacements(op: enum { index, scroll_up, resize }) !void {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Cover the primary screen with history disabled and the alternate
+    // screen, including single-row screens and scrolls across pages.
+    for ([_]bool{ false, true }) |alternate| {
+        for ([_]size.CellCountInt{ 6, 1, 200 }) |rows| {
+            if (op == .resize and rows == 1) continue;
+            var t = try terminal.Terminal.init(io, alloc, .{
+                .cols = 80,
+                .rows = rows,
+                .max_scrollback_bytes = if (alternate) 4096 else 0,
+            });
+            defer t.deinit(alloc);
+            if (alternate) _ = try t.switchScreen(.alternate);
+            t.width_px = 80;
+            t.height_px = rows;
+            const screen = t.screens.active;
+            const tracked = screen.pages.countTrackedPins();
+            const s = &screen.kitty_images;
+            try s.addImage(io, alloc, screen, .{
+                .id = 1,
+                .width = 1,
+                .height = 1,
+                .data = .{ .complete = try alloc.dupe(u8, "rgba") },
+            });
+            try s.addPlacement(io, alloc, screen, 1, 1, .{
+                .location = .{ .pin = try trackPin(&t, .{ .x = 9, .y = 0 }) },
+            });
+            // Both children and grandchildren of the erased anchor go away.
+            for (2..4) |id| {
+                try s.addPlacement(io, alloc, screen, 1, @intCast(id), .{
+                    .location = .{ .relative = .{ .parent = .{
+                        .image_id = 1,
+                        .placement_id = .{ .tag = .external, .id = @intCast(id - 1) },
+                    } } },
+                });
+            }
+            try s.addPlacement(io, alloc, screen, 1, 4, .{
+                .location = .{ .virtual = {} },
+            });
+            if (rows > 1) try s.addPlacement(io, alloc, screen, 1, 5, .{
+                .location = .{ .pin = try trackPin(&t, .{ .x = 19, .y = rows - 1 }) },
+            });
+
+            // Keep the bottom row occupied so shrinking discards the top
+            // row instead of merely trimming trailing blank rows.
+            t.setCursorPos(rows, 1);
+            try t.print('X');
+            const dirty = s.dirty;
+            const generation = s.generation;
+            const removed_rows: size.CellCountInt = if (op == .scroll_up and rows > 1) 2 else 1;
+            switch (op) {
+                .index => try t.index(),
+                .scroll_up => try t.scrollUp(removed_rows),
+                .resize => try t.resize(alloc, .{ .cols = 80, .rows = rows - 1, .cell_size_px = .{ .width = 1, .height = 1 } }),
+            }
+
+            const retained: usize = if (rows > 1) 2 else 1;
+            try testing.expectEqual(retained, s.placements.count());
+            try testing.expect(s.placements.contains(.{
+                .image_id = 1,
+                .placement_id = .{ .tag = .external, .id = 4 },
+            }));
+            if (rows > 1) {
+                const p = s.placements.get(.{
+                    .image_id = 1,
+                    .placement_id = .{ .tag = .external, .id = 5 },
+                }).?;
+                try testing.expectEqual(
+                    point.Point{ .active = .{ .x = 19, .y = rows - 1 - removed_rows } },
+                    screen.pages.pointFromPin(.active, p.location.pin.*).?,
+                );
+            }
+            try testing.expectEqual(tracked + retained - 1, screen.pages.countTrackedPins());
+            try testing.expect(s.dirty != dirty);
+            try testing.expect(s.generation != generation);
+            try testing.expectEqual(@as(usize, 1), s.images.count());
+            try testing.expectEqual(retained, s.imageById(1).?.metadata.placement_count);
+            try testing.expectEqualStrings("rgba", s.imageById(1).?.data.bytes().?);
+            try testing.expectEqual(@as(usize, 4), s.total_bytes);
+        }
+    }
+}
+
+test "storage: no scrollback index preserves partially visible placement" {
+    try testPartiallyVisiblePlacement(.index);
+}
+
+test "storage: no scrollback scroll up preserves partially visible placement" {
+    try testPartiallyVisiblePlacement(.scroll_up);
+}
+
+test "storage: no scrollback resize preserves partially visible placement" {
+    try testPartiallyVisiblePlacement(.resize);
+}
+
+fn testPartiallyVisiblePlacement(op: enum { index, scroll_up, resize }) !void {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    for ([_]bool{ false, true }) |alternate| {
+        for ([_]bool{ false, true }) |scaled| {
+            for ([_]u16{ 1, 6, 200 }) |rows| {
+                if (op == .resize and rows == 1) continue;
+                var t = try terminal.Terminal.init(io, alloc, .{ .cols = 80, .rows = rows, .max_scrollback_bytes = 0 });
+                defer t.deinit(alloc);
+                if (alternate) _ = try t.switchScreen(.alternate);
+                t.width_px = 800;
+                t.height_px = @as(u32, rows) * 10;
+                const screen = t.screens.active;
+                const storage = &screen.kitty_images;
+                try storage.addImage(io, alloc, screen, .{ .id = 1, .width = 10, .height = 30 });
+                const key: ImageStorage.PlacementKey = .{ .image_id = 1, .placement_id = .{ .tag = .external, .id = 1 } };
+                try storage.addPlacement(io, alloc, screen, 1, 1, .{
+                    .location = .{ .pin = try trackPin(&t, .{ .x = 3, .y = 0 }) },
+                    .rows = if (scaled) 3 else 0,
+                    .columns = if (scaled) 1 else 0,
+                });
+                try storage.addPlacement(io, alloc, screen, 1, 2, .{
+                    .location = .{ .relative = .{ .parent = key, .vertical_offset = 2 } },
+                });
+                t.setCursorPos(rows, 1);
+                try t.print('X');
+                switch (op) {
+                    .index => try t.index(),
+                    .scroll_up => try t.scrollUp(1),
+                    .resize => try t.resize(alloc, .{ .cols = 80, .rows = rows - 1, .cell_size_px = .{ .width = 10, .height = 10 } }),
+                }
+                try testing.expectEqual(@as(usize, 2), storage.placements.count());
+                const p = storage.placements.get(key).?;
+                try testing.expectEqual(@as(i32, -1), p.row_offset);
+                try testing.expectEqual(point.Point{ .active = .{ .x = 3, .y = 0 } }, screen.pages.pointFromPin(.active, p.location.pin.*).?);
+                try testing.expectEqual(@as(u32, 3), p.gridSize(storage.images.get(1).?, &t).rows);
+                try testing.expectEqual(@as(u32, 0), p.source_y);
+                const chain = storage.resolveChain(.{ .parent = key, .vertical_offset = 2 }).?;
+                try testing.expectEqual(@as(i32, 2), chain.vertical_offset);
+                // The root and its descendants disappear only after the last row.
+                t.setCursorPos(t.rows, 1);
+                try t.index();
+                try testing.expectEqual(@as(usize, 2), storage.placements.count());
+                try t.index();
+                try testing.expectEqual(@as(usize, 0), storage.placements.count());
+                try testing.expectEqual(@as(usize, 1), storage.images.count());
+            }
+        }
+    }
+}
+
+test "storage: tiny scrollback preserves image across pruned pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 80, .rows = 6, .max_scrollback_bytes = 4096 });
+    defer t.deinit(alloc);
+    t.width_px = 800;
+    t.height_px = 60;
+    const screen = t.screens.active;
+    const storage = &screen.kitty_images;
+    const image_rows: u32 = @as(u32, screen.pages.pages.first.?.capacity().rows) * 2;
+    try storage.addImage(io, alloc, screen, .{ .id = 1, .width = 1, .height = 1 });
+    try storage.addPlacement(io, alloc, screen, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 3, .y = 0 }) },
+        .rows = image_rows,
+        .columns = 1,
+    });
+    t.setCursorPos(6, 1);
+    var saw_prune = false;
+    for (1..image_rows * 3) |scrolls| {
+        try t.index();
+        const history = screen.pages.total_rows - screen.pages.rows;
+        if (scrolls >= image_rows + history) {
+            try testing.expectEqual(@as(usize, 0), storage.placements.count());
+            try testing.expect(saw_prune);
+            return;
+        }
+        const p = storage.placements.get(.{ .image_id = 1, .placement_id = .{ .tag = .external, .id = 1 } }).?;
+        const pt = screen.pages.pointFromPin(.screen, p.location.pin.*).?;
+        try testing.expect(!p.location.pin.garbage);
+        try testing.expectEqual(@as(i64, @intCast(history)) - @as(i64, @intCast(scrolls)), @as(i64, pt.coord().y) + p.row_offset);
+        saw_prune = saw_prune or p.row_offset < 0;
+    }
+    return error.ImageNeverLeftHistory;
 }
 
 test "storage: cell offsets stay within explicit destination rectangle" {

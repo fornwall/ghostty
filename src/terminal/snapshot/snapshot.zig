@@ -522,6 +522,13 @@ pub const Decoder = struct {
                         result.screens.get(key).?,
                     );
                     header = try record.nextHeader(reader);
+                    if (header.tag == .kitty_image_placement_offsets) {
+                        const target_screen = result.screens.get(key).?;
+                        try kitty.decodePlacementOffsets(reader, header, key, .{
+                            .screen = target_screen,
+                        });
+                        header = try record.nextHeader(reader);
+                    }
                 }
             }
         }
@@ -925,6 +932,19 @@ pub const Decoder = struct {
                         .ready_generation = state.kitty_generations.get(sequence.key).?,
                     } else null,
                 );
+                const after_placements = record.nextHeader(self.source) catch |err| {
+                    state.pending_error = err;
+                    return progress;
+                };
+                if (after_placements.tag == .kitty_image_placement_offsets) {
+                    try kitty.decodePlacementOffsets(self.source, after_placements, sequence.key, if (applied) |s| .{
+                        .screen = s,
+                        .page = s.pages.pages.first.?,
+                        .ready_generation = state.kitty_generations.get(sequence.key).?,
+                    } else null);
+                } else {
+                    state.pending_header = after_placements;
+                }
                 return progress;
             }
         }

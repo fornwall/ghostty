@@ -2500,7 +2500,7 @@ fn indexScrollWithImages(
     self: *Terminal,
     comptime op: kitty.graphics.ImageStorage.ScrollOp,
 ) !void {
-    var kitty_scroll = self.kittyScrollMarginsBegin(-1, op);
+    var kitty_scroll = self.kittyScrollBegin(-1, op);
     defer if (kitty_scroll) |*state| state.end();
     switch (op) {
         .window_shift => try self.screens.active.cursorScrollAbove(),
@@ -2511,8 +2511,8 @@ fn indexScrollWithImages(
 }
 
 // Handle when Kitty graphics is disabled.
-const KittyScrollMargins = if (build_options.kitty_graphics)
-    kitty.graphics.ImageStorage.ScrollMargins
+const KittyScroll = if (build_options.kitty_graphics)
+    kitty.graphics.ImageStorage.Scroll
 else
     struct {
         pub inline fn end(self: *@This()) void {
@@ -2521,30 +2521,31 @@ else
     };
 
 /// Begin adjusting kitty image placements for a scroll of the
-/// scrolling region by delta rows (negative moves content up). If
-/// adjustment is needed this returns state whose end() must be called
-/// after the scroll's row operations complete (see
-/// ImageStorage.scrollMarginsBegin for why this is two phases). This
-/// returns null when the scrolling region is the full screen, because
-/// placements then follow their anchored rows via pin tracking which
-/// matches kitty's marginless behavior.
+/// scrolling region by delta rows (negative moves content up). Every
+/// returned state must have end() called after the row operations.
+/// Full-screen upward scrolls preserve origins beyond retained history;
+/// margin scrolls clip placements at the region boundaries.
 ///
 /// Callers must comptime-gate on build_options.kitty_graphics and
 /// check that placements exist before calling, which keeps the cost
 /// on the hot scroll paths cheap.
-fn kittyScrollMarginsBegin(
+fn kittyScrollBegin(
     self: *Terminal,
     delta: isize,
     op: kitty.graphics.ImageStorage.ScrollOp,
-) ?kitty.graphics.ImageStorage.ScrollMargins {
+) ?kitty.graphics.ImageStorage.Scroll {
     @branchHint(.cold);
 
-    // Full-screen scrolls need no adjustment: placements follow their
-    // anchored rows (possibly into the scrollback) via pin tracking.
+    // Full-screen upward scrolls can discard anchor rows at the history
+    // boundary while lower parts of the image remain visible.
     if (self.scrolling_region.top == 0 and
         self.scrolling_region.bottom == self.rows - 1 and
         self.scrolling_region.left == 0 and
-        self.scrolling_region.right == self.cols - 1) return null;
+        self.scrolling_region.right == self.cols - 1)
+    {
+        if (delta >= 0) return null;
+        return self.screens.active.kitty_images.scrollFullScreenBegin(self.io(), self, delta);
+    }
 
     const screen: *Screen = self.screens.active;
     return screen.kitty_images.scrollMarginsBegin(
@@ -2724,14 +2725,14 @@ pub fn scrollDown(self: *Terminal, count: usize) void {
     // adjusting around the scroll. Note this wraps scrollDown and NOT
     // insertLines: kitty scrolls images for SD/RI but leaves them
     // alone for IL/DL.
-    var kitty_scroll: ?KittyScrollMargins = null;
+    var kitty_scroll: ?KittyScroll = null;
     defer if (kitty_scroll) |*state| state.end();
     if (comptime build_options.kitty_graphics) {
         if (self.screens.active.kitty_images.placements.count() != 0) {
             @branchHint(.unlikely);
             const region_height: usize =
                 @as(usize, self.scrolling_region.bottom - self.scrolling_region.top) + 1;
-            kitty_scroll = self.kittyScrollMarginsBegin(
+            kitty_scroll = self.kittyScrollBegin(
                 @intCast(@min(count, region_height)),
                 .in_place,
             );
@@ -2764,7 +2765,7 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
     // adjusting around the scroll. Note this wraps scrollUp and NOT
     // deleteLines: kitty scrolls images for SU/IND but leaves them
     // alone for IL/DL.
-    var kitty_scroll: ?KittyScrollMargins = null;
+    var kitty_scroll: ?KittyScroll = null;
     defer if (kitty_scroll) |*state| state.end();
     if (comptime build_options.kitty_graphics) {
         if (self.screens.active.kitty_images.placements.count() != 0) {
@@ -2775,7 +2776,7 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
             // moves rows in place.
             const region_height: usize =
                 @as(usize, self.scrolling_region.bottom - self.scrolling_region.top) + 1;
-            kitty_scroll = self.kittyScrollMarginsBegin(
+            kitty_scroll = self.kittyScrollBegin(
                 -@as(isize, @intCast(@min(count, region_height))),
                 if (self.scrolling_region.top == 0 and
                     self.scrolling_region.left == 0 and
@@ -4190,12 +4191,17 @@ pub fn resize(
     // and alt fails than the reverse.
     try tw.check(.primary_screen);
     const primary = self.screens.get(.primary).?;
+    const kitty_cell_size: @FieldType(Screen.Resize, "kitty_cell_size") = if (comptime build_options.kitty_graphics) .{
+        .width = self.width_px / opts.cols,
+        .height = self.height_px / opts.rows,
+    } else .{};
     try primary.resize(.{
         .cols = opts.cols,
         .rows = opts.rows,
         .reflow = self.modes.get(.wraparound),
         .prompt_redraw = self.flags.shell_redraws_prompt,
         .pull_scrollback = self.flags.resize_pull_scrollback,
+        .kitty_cell_size = kitty_cell_size,
     });
 
     // Alternate screen, if it exists, doesn't reflow. The primary resize
@@ -4210,6 +4216,7 @@ pub fn resize(
                 .rows = opts.rows,
                 .reflow = false,
                 .pull_scrollback = self.flags.resize_pull_scrollback,
+                .kitty_cell_size = kitty_cell_size,
             }) catch |err| break :resize err;
 
             // Resize succeeded.

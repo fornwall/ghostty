@@ -639,7 +639,7 @@ fn computeViewportPos(
         col_offset: i32 = 0,
         row_offset: i32 = 0,
     } = switch (p.location) {
-        .pin => |pin| .{ .pin = pin },
+        .pin => |pin| .{ .pin = pin, .row_offset = p.row_offset },
         .virtual => return .{ .col = 0, .row = 0, .visible = false },
         .relative => |rel| origin: {
             const storage = &t.screens.active.kitty_images;
@@ -649,7 +649,7 @@ fn computeViewportPos(
                 .pin => |root_pin| break :origin .{
                     .pin = root_pin,
                     .col_offset = chain.horizontal_offset,
-                    .row_offset = chain.vertical_offset,
+                    .row_offset = chain.vertical_offset +| chain.root.row_offset,
                 },
                 .virtual => return .{ .col = 0, .row = 0, .visible = false },
                 .relative => unreachable, // resolveChain roots are never relative
@@ -1441,6 +1441,39 @@ test "placement_viewport_pos bottom off-screen" {
     try testing.expectEqual(Result.success, placement_viewport_pos(iter, img, t, &col, &row));
     try testing.expectEqual(0, col);
     try testing.expectEqual(3, row);
+}
+
+test "placement_viewport_pos after anchor row is discarded" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(testing.allocator);
+    _ = try t.switchScreen(.alternate);
+    t.width_px = 100;
+    t.height_px = 60;
+    const screen = t.screens.active;
+    const storage = &screen.kitty_images;
+    const img: Image = .{ .id = 1, .width = 1, .height = 1 };
+    try storage.addImage(testing.io, testing.allocator, screen, img);
+    const key: kitty_storage.ImageStorage.PlacementKey = .{ .image_id = 1, .placement_id = .{ .tag = .external, .id = 1 } };
+    try storage.addPlacement(testing.io, testing.allocator, screen, 1, 1, .{
+        .location = .{ .pin = try screen.pages.trackPin(screen.pages.pin(.{ .active = .{ .x = 3 } }).?) },
+        .columns = 1,
+        .rows = 3,
+    });
+    try t.scrollUp(1);
+    const p = storage.placements.get(key).?;
+    const pos = computeViewportPos(&p, &img, &t);
+    try testing.expect(pos.visible);
+    try testing.expectEqual(@as(i32, 3), pos.col);
+    try testing.expectEqual(@as(i32, -1), pos.row);
+    const child: kitty_storage.ImageStorage.Placement = .{
+        .location = .{ .relative = .{ .parent = key, .vertical_offset = 2 } },
+        .columns = 1,
+        .rows = 1,
+    };
+    const child_pos = computeViewportPos(&child, &img, &t);
+    try testing.expect(child_pos.visible);
+    try testing.expectEqual(@as(i32, 1), child_pos.row);
 }
 
 test "placement_viewport_pos top and bottom off-screen" {
