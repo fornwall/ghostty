@@ -2072,6 +2072,12 @@ pub const Resize = struct {
     cols: size.CellCountInt,
     rows: size.CellCountInt,
 
+    /// Pixel size of a cell, used to retain partially visible images.
+    kitty_cell_size: if (build_options.kitty_graphics)
+        kitty.graphics.ImageStorage.CellSize
+    else
+        struct {} = .{},
+
     /// Whether to reflow soft-wrapped text.
     ///
     /// This will reflow soft-wrapped text. If the screen size is getting
@@ -2191,17 +2197,19 @@ pub inline fn resize(
     // because we do NO cleanup of the state below.
     errdefer comptime unreachable;
 
-    // Resizing moves image placements, so mark their geometry as dirty.
-    if (comptime build_options.kitty_graphics) self.kitty_images.markDirty();
-
     // If we have no scrollback and we shrunk our rows, we must explicitly
     // erase our history. This is because PageList always keeps at least
     // a page size of history.
-    if (self.no_scrollback) self.pages.eraseHistory(null);
-
-    // If our cursor was updated, we do a full reload so all our cursor
-    // state is correct.
-    self.cursorReload();
+    if (self.no_scrollback) {
+        if (comptime build_options.kitty_graphics) {
+            self.kitty_images.discardHistory(self.io, self, opts.kitty_cell_size);
+        }
+        self.eraseHistory(null);
+    } else {
+        self.cursorReload();
+        // Resizing moves image placements, so mark their geometry as dirty.
+        if (comptime build_options.kitty_graphics) self.kitty_images.markDirty();
+    }
 
     // If resize moved a cursor with pending wrap away from the right edge,
     // advance to the next cell instead of wrapping on the next print.

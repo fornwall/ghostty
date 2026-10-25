@@ -282,6 +282,14 @@
 //! - 2 relative: parent image ID (u32), parent placement ID tag (u8), parent
 //!   placement ID (u32), horizontal offset (i32), vertical offset (i32).
 //!
+//! An optional KITTY_IMAGE_PLACEMENT_OFFSETS record immediately follows
+//! KITTY_IMAGE_STORAGE or KITTY_IMAGE_PAGE_PLACEMENTS when any pinned image
+//! begins above retained history. Its payload is the screen key (u16), count
+//! (u32), then count entries of placement key (image ID u32, placement ID tag
+//! u8, placement ID u32) and non-positive row offset (i32). Other placements
+//! default to zero. Older decoders can skip this record without changing the
+//! layout of the placement records.
+//!
 //! #### In-progress load
 //!
 //! A chunked transmission that was cut off between two chunks. The decoder
@@ -863,6 +871,31 @@ pub const ScreenPlan = struct {
         if (storage.loading) |loading| try encodeLoading(writer, loading);
 
         try destination.finish();
+        try self.encodeOffsets(destination, self.resident);
+    }
+
+    fn encodeOffsets(
+        self: *const ScreenPlan,
+        destination: *record.Writer,
+        placements: []const PlannedPlacement,
+    ) EncodeError!void {
+        var count: u32 = 0;
+        for (placements) |planned| {
+            if (planned.placement.row_offset != 0) count += 1;
+        }
+        if (count == 0) return;
+        const writer = destination.begin(.kitty_image_placement_offsets);
+        errdefer destination.cancel();
+        try encodeKey(writer, self.key);
+        try io.writeInt(writer, u32, count);
+        for (placements) |planned| {
+            if (planned.placement.row_offset == 0) continue;
+            assert(planned.placement.location == .pin);
+            assert(planned.placement.row_offset < 0);
+            try encodePlacementKey(writer, planned.key);
+            try io.writeInt(writer, i32, planned.placement.row_offset);
+        }
+        try destination.finish();
     }
 
     /// Plan a payload for every image and frame whose pixels are present,
@@ -1014,6 +1047,7 @@ pub const ScreenPlan = struct {
                 try encodePlacement(writer, planned, .page);
             }
             try destination.finish();
+            try self.encodeOffsets(destination, self.history[start..end]);
         }
 
         while (self.payload_next < self.history_payloads.end and
@@ -2009,6 +2043,40 @@ pub fn decodePagePlacements(
     try record_reader.finish();
 }
 
+/// Restore offsets from the preceding placements. For deferred history,
+/// restrict updates to the new page so live replacements are unaffected.
+pub fn decodePlacementOffsets(
+    source: *std.Io.Reader,
+    header: record.Header,
+    key: TerminalScreenKey,
+    target: ?struct {
+        screen: *TerminalScreen,
+        page: ?*Node = null,
+        ready_generation: u64 = std.math.maxInt(u64),
+    },
+) DecodeError!void {
+    var rr: record.Reader = undefined;
+    rr.initHeader(source, header);
+    if (header.tag != .kitty_image_placement_offsets) return error.UnexpectedRecordTag;
+    const reader = rr.payloadReader();
+    if (try decodeKey(reader) != key) return error.UnexpectedKittyKey;
+    const count = try io.readInt(reader, u32);
+    for (0..count) |_| {
+        const placement_key = try DecodedPlacement.decodePlacementKey(reader);
+        const offset = try io.readInt(reader, i32);
+        if (offset > 0) continue;
+        const t = target orelse continue;
+        const k = placement_key orelse continue;
+        const storage = &t.screen.kitty_images;
+        const p = storage.placements.getPtr(k) orelse continue;
+        if (p.location != .pin) continue;
+        if (t.page) |page| if (p.location.pin.node != page) continue;
+        if (storage.images.get(k.image_id).?.transmission > t.ready_generation) continue;
+        p.row_offset = offset;
+    }
+    try rr.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 
@@ -2162,6 +2230,7 @@ fn expectStorageEqual(
             ),
         }
         try testing.expectEqual(e.x_offset, a.x_offset);
+        try testing.expectEqual(e.row_offset, a.row_offset);
         try testing.expectEqual(e.y_offset, a.y_offset);
         try testing.expectEqual(e.source_x, a.source_x);
         try testing.expectEqual(e.source_y, a.source_y);
@@ -2464,6 +2533,53 @@ test "golden snapshot with an image on the alternate screen" {
     try testGolden(&t, "kitty-alternate", &test_alternate_fixture);
 }
 
+test "snapshot preserves image origin above retained rows" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |history| {
+        var t = try testTerminal(80, 6);
+        defer t.deinit(testing.allocator);
+        if (history) t.setScrollbackMaxBytes(4096) else _ = try t.switchScreen(.alternate);
+        const image_rows = @as(u32, t.screens.active.pages.pages.first.?.capacity().rows) * 3;
+        var command_buf: [128]u8 = undefined;
+        const command = try std.fmt.bufPrint(&command_buf, "a=T,f=32,s=1,v=1,i=1,p=1,c=1,r={d},C=1,q=2", .{image_rows});
+        try testCommand(&t, command, &.{ 255, 0, 0, 255 });
+        t.setCursorPos(6, 1);
+        const key: PlacementKey = .{ .image_id = 1, .placement_id = .{ .tag = .external, .id = 1 } };
+        for (0..image_rows) |_| {
+            try t.index();
+            if (t.screens.active.kitty_images.placements.get(key).?.row_offset < 0) break;
+        }
+        try testing.expect(t.screens.active.kitty_images.placements.get(key).?.row_offset < 0);
+        // Move the anchor's retained page wholly into history so this case
+        // also exercises offsets restored after READY with history pages.
+        if (history) {
+            for (0..t.rows) |_| try t.index();
+            try testing.expect(t.screens.active.pages.pages.first.? != t.screens.active.pages.getTopLeft(.active).node);
+        }
+        const encoded = try testEncode(&t);
+        defer testing.allocator.free(encoded);
+        var restored = try testDecode(encoded, test_decode_options);
+        defer restored.deinit(testing.allocator);
+        try expectStorageEqual(&t, &restored, t.screens.active_key);
+
+        var original_state: RenderState = .empty;
+        defer original_state.deinit(testing.allocator);
+        var restored_state: RenderState = .empty;
+        defer restored_state.deinit(testing.allocator);
+        try original_state.update(testing.allocator, &t);
+        try restored_state.update(testing.allocator, &restored);
+        var original_it = original_state.imagePlacementIterator();
+        var restored_it = restored_state.imagePlacementIterator();
+        const original = original_it.next().?;
+        const copy = restored_it.next().?;
+        try testing.expect(original.y < 0);
+        try testing.expectEqual(original.y, copy.y);
+        try testing.expectEqual(original.rows, copy.rows);
+        try testing.expect(original_it.next() == null);
+        try testing.expect(restored_it.next() == null);
+    }
+}
+
 /// One framed record within an encoded snapshot.
 const TestRecord = struct {
     start: usize,
@@ -2495,6 +2611,7 @@ fn testIsKittyTag(tag: record.Tag) bool {
         .kitty_image_storage,
         .kitty_image_payload,
         .kitty_image_page_placements,
+        .kitty_image_placement_offsets,
         => true,
         else => false,
     };

@@ -128,6 +128,10 @@ pub const Tag = enum(u16) {
     /// before this record. Optional. See `kitty.zig`.
     kitty_image_page_placements = 10,
 
+    /// Origins above retained history for the preceding Kitty placements.
+    /// Optional. See `kitty.zig`.
+    kitty_image_placement_offsets = 11,
+
     _,
 
     /// Returns true if this build decodes records with this tag, and false
@@ -156,6 +160,7 @@ pub const Tag = enum(u16) {
             .kitty_image_storage,
             .kitty_image_payload,
             .kitty_image_page_placements,
+            .kitty_image_placement_offsets,
             => build_options.kitty_graphics,
 
             _ => false,

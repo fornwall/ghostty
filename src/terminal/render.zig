@@ -2412,7 +2412,7 @@ const Kitty = struct {
                 .pin => |pin| .{
                     .anchor = .{ .pin = pin },
                     .horizontal_offset = 0,
-                    .vertical_offset = 0,
+                    .vertical_offset = kv.value_ptr.row_offset,
                     .placement = template(
                         storage,
                         t,
@@ -2437,7 +2437,7 @@ const Kitty = struct {
                             .relative => unreachable,
                         },
                         .horizontal_offset = chain.horizontal_offset,
-                        .vertical_offset = chain.vertical_offset,
+                        .vertical_offset = chain.vertical_offset +| chain.root.row_offset,
                         .placement = template(
                             storage,
                             t,
