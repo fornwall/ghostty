@@ -2909,6 +2909,9 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
             // Making rows larger we adjust our row count, and then grow
             // to the row count.
             .gt => gt: {
+                const old_rows = self.rows;
+                errdefer self.rows = old_rows;
+
                 // If our rows increased and our cursor is NOT at the bottom,
                 // we want to try to preserve the y value of the old cursor.
                 // In other words, we don't want to "pull down" scrollback.
@@ -2927,7 +2930,7 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                     // scrollback.
                     const delta = rows - self.rows;
                     self.rows = rows;
-                    for (0..delta) |_| _ = try self.grow();
+                    try self.growRows(delta);
                     break :gt;
                 }
 
@@ -2955,7 +2958,7 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                     if (count >= rows) break;
                 } else {
                     assert(count < rows);
-                    for (count..rows) |_| _ = try self.grow();
+                    try self.growRows(rows - count);
                 }
 
                 // Make sure that the viewport pin isn't below the active
@@ -4018,6 +4021,10 @@ pub fn setMaxLines(self: *PageList, max: ?usize) void {
     self.limits.enforce(self, .lines);
 }
 
+const grow_tw = tripwire.module(enum {
+    create_page,
+}, grow);
+
 /// Grow the active area by exactly one row.
 ///
 /// This may allocate, but also may not if our current page has more
@@ -4187,6 +4194,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     }
 
     // We need to allocate a new memory buffer.
+    try grow_tw.check(.create_page);
     const next_node = try self.createPage(.{ .cap = cap });
     // we don't errdefer this because we've added it to the linked
     // list and its fine to have dangling unused pages.
@@ -7505,10 +7513,13 @@ pub fn memoryUsage(self: *const PageList) MemoryUsage {
     };
 }
 
-/// Grow the number of rows available in the page list by n.
-/// This is only used for testing so it isn't optimized in any way.
+/// Grow the number of rows available in the page list by n. On failure,
+/// the rows already added are removed again.
 fn growRows(self: *PageList, n: usize) Allocator.Error!void {
-    for (0..n) |_| _ = try self.grow();
+    for (0..n) |i| _ = self.grow() catch |err| {
+        if (i > 0) self.total_rows -= self.trimTrailingBlankRows(@intCast(i));
+        return err;
+    };
 }
 
 /// Clear all dirty bits on all pages. This is not efficient since it
@@ -15890,6 +15901,42 @@ test "PageList resize (no reflow) more rows" {
             .x = 0,
             .y = 0,
         } }, pt);
+    }
+}
+
+test "PageList resize (no reflow) more rows restores rows on failure" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    for ([_]bool{ true, false }) |pull_scrollback| {
+        const tw = grow_tw;
+        defer tw.end(.reset) catch unreachable;
+
+        var s = try init(alloc, .{ .cols = 10, .rows = 3, .max_size = 0 });
+        defer s.deinit();
+
+        // One free row in the last page: the first grow fits, the second
+        // must allocate.
+        const last = s.pages.last.?;
+        try s.growRows(last.capacity().rows - last.rows() - 1);
+        const total_rows = s.totalRows();
+        const active = s.getTopLeft(.active);
+        const opts: Resize = .{
+            .rows = @intCast(total_rows + 2),
+            .reflow = false,
+            .pull_scrollback = pull_scrollback,
+        };
+
+        tw.errorAlways(.create_page, error.OutOfMemory);
+        try testing.expectError(error.OutOfMemory, s.resize(opts));
+        try tw.end(.reset);
+
+        try testing.expectEqual(@as(usize, 3), s.rows);
+        try testing.expectEqual(total_rows, s.totalRows());
+        try testing.expect(active.eql(s.getTopLeft(.active)));
+
+        try s.resize(opts);
+        try testing.expectEqual(opts.rows.?, s.rows);
     }
 }
 
